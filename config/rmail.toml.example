@@ -1,0 +1,47 @@
+# rmail — example config
+# Copy to /etc/rmail/rmail.toml and edit.
+
+[server]
+# Public hostname of this server. MUST match the A/AAAA + PTR records.
+hostname        = "mail.example.com"
+# SMTP listeners: 25 (MTA-to-MTA), 587 (Submission), 465 (SMTPS).
+listen_smtp     = ["0.0.0.0:25", "0.0.0.0:587", "0.0.0.0:465"]
+# IMAP listeners: 143 (STARTTLS) and 993 (implicit TLS).
+listen_imap     = ["0.0.0.0:143", "0.0.0.0:993"]
+# Reject any DATA larger than this.
+max_message_mb  = 25
+
+[storage]
+queue_dir   = "/var/lib/rmail/queue"
+mailbox_dir = "/var/lib/rmail/mail"
+
+[tls]
+# Server-wide cert. Must include all hostnames you serve (mail.example.com,
+# autoconfig, mta-sts, etc.). Renewed via `rmailctl tls renew`.
+cert = "/etc/rmail/tls/cert.pem"
+key  = "/etc/rmail/tls/key.pem"
+
+[delivery]
+# Outbound queue policy. Times are seconds unless noted.
+max_retries        = 25
+initial_retry_secs = 300       # 5 minutes
+max_retry_secs     = 14400     # 4 hours
+bounce_after_hours = 120       # 5 days, RFC-recommended
+
+# ─── Domains we host ────────────────────────────────────────────────
+[[domain]]
+name          = "example.com"
+dkim_selector = "rmail"
+dkim_key      = "/etc/rmail/dkim/example.com.key"
+# Optional DMARC reporting address; if unset, no rua= is emitted.
+dmarc_rua     = "dmarc@example.com"
+
+# ─── Users ───────────────────────────────────────────────────────────
+# password_hash is argon2id. Generate with: `rmailctl user add ...`
+[[user]]
+address       = "alice@example.com"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME$REPLACE_ME"
+
+[[user]]
+address       = "postmaster@example.com"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME$REPLACE_ME"

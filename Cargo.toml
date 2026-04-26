@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members  = [
+    "crates/core",
+    "crates/config",
+    "crates/queue",
+    "crates/mailbox",
+    "crates/smtp",
+    "crates/imap",
+    "crates/dns",
+    "crates/tls",
+    "crates/auth",
+    "crates/server",
+    "bin/rmail",
+    "bin/rmailctl",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.78"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/selimawn/rmail"
+
+[workspace.dependencies]
+tokio              = { version = "1", features = ["full"] }
+tokio-rustls       = "0.26"
+rustls             = "0.23"
+rustls-pemfile     = "2"
+hickory-resolver   = "0.24"
+mail-parser        = "0.9"
+mail-builder       = "0.3"
+mail-auth          = "0.6"
+nom                = "7"
+serde              = { version = "1", features = ["derive"] }
+toml               = "0.8"
+clap               = { version = "4", features = ["derive"] }
+argon2             = "0.5"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror          = "1"
+anyhow             = "1"
+time               = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+bytes              = "1"
+bincode            = "1.3"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = true

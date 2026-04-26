@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# secrets / local data
+*.pem
+*.key
+/local-data/
+.env
+.env.local
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

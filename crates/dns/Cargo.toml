@@ -1,0 +1,11 @@
+[package]
+name    = "rmail-dns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls"] }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
+serde     = { workspace = true }

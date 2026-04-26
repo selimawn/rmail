@@ -16,28 +16,37 @@ queue_dir   = "/var/lib/rmail/queue"
 mailbox_dir = "/var/lib/rmail/mail"
 
 [tls]
-# Server-wide cert. Must include all hostnames you serve (mail.example.com,
-# autoconfig, mta-sts, etc.). Renewed via `rmailctl tls renew`.
+# Server-wide cert. Renewed via `rmailctl tls renew`.
 cert = "/etc/rmail/tls/cert.pem"
 key  = "/etc/rmail/tls/key.pem"
 
-[delivery]
-# Outbound queue policy. Times are seconds unless noted.
-max_retries        = 25
-initial_retry_secs = 300       # 5 minutes
-max_retry_secs     = 14400     # 4 hours
-bounce_after_hours = 120       # 5 days, RFC-recommended
+# ─── DNS ────────────────────────────────────────────────────────────────────
+[dns]
+# Cloudflare DNS is used exclusively. The system resolver (/etc/resolv.conf)
+# is NEVER consulted. This is not configurable — it is a design decision.
+#
+# Addresses (hardcoded in crates/dns/src/lib.rs, mirrored here for clarity):
+#   IPv4:  1.1.1.1  /  1.0.0.1
+#   IPv6:  2606:4700:4700::1111  /  2606:4700:4700::1001
+#
+# Transport: UDP with TCP fallback for large records (e.g. long DKIM keys).
+# DNSSEC validation is disabled by default; enable once tested:
+dnssec = false
 
-# ─── Domains we host ────────────────────────────────────────────────
+[delivery]
+max_retries        = 25
+initial_retry_secs = 300
+max_retry_secs     = 14400
+bounce_after_hours = 120
+
+# ─── Domains we host ────────────────────────────────────────────────────────
 [[domain]]
 name          = "example.com"
 dkim_selector = "rmail"
 dkim_key      = "/etc/rmail/dkim/example.com.key"
-# Optional DMARC reporting address; if unset, no rua= is emitted.
 dmarc_rua     = "dmarc@example.com"
 
-# ─── Users ───────────────────────────────────────────────────────────
-# password_hash is argon2id. Generate with: `rmailctl user add ...`
+# ─── Users ──────────────────────────────────────────────────────────────────
 [[user]]
 address       = "alice@example.com"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME$REPLACE_ME"

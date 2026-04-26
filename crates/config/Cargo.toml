@@ -1,0 +1,10 @@
+[package]
+name    = "rmail-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rmail-core = { path = "../core" }
+serde      = { workspace = true }
+toml       = { workspace = true }
+thiserror  = { workspace = true }

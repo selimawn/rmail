@@ -1,0 +1,10 @@
+[package]
+name    = "rmail-mailbox"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rmail-core = { path = "../core" }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }

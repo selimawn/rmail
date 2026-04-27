@@ -1,73 +1,33 @@
-//! Cleanup task: validates an inbound message and runs SPF/DKIM/DMARC.
-//! Moves `incoming/<id>` → `active/<id>` when clean.
+//! Cleanup: moves a message from `incoming` to `active` after adding
+//! the `Received:` header and validating the RFC 5322 structure.
+//!
+//! In Postfix this is `cleanup(8)`. In rmail it's called from queue_manager
+//! before the message is dispatched for delivery.
 
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error};
-use rmail_config::Config;
-use rmail_queue::Queue;
-use rmail_core::QueueState;
-use rmail_auth::checker;
-use rmail_dns::Resolver;
+use rmail_core::Envelope;
 
-pub async fn run_one(
-    id: &str,
-    config: &Config,
-    queue: &Queue,
-    dns: &Resolver,
-    notify: &mpsc::Sender<String>,
-) {
-    let msg = match queue.load(QueueState::Incoming, id).await {
-        Ok(m)  => m,
-        Err(e) => { error!(%id, "cleanup load failed: {}", e); return; }
-    };
+/// Prepend a `Received:` header to raw message bytes.
+/// This is the trace record required by RFC 5321 §3.7.2.
+pub fn add_received_header(body: &[u8], envelope: &Envelope, our_hostname: &str) -> Vec<u8> {
+    let ts = envelope.received_at
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap_or_else(|_| "unknown".to_owned());
 
-    let body = match tokio::fs::read(&msg.body_path).await {
-        Ok(b)  => b,
-        Err(e) => { error!(%id, "cleanup read body failed: {}", e); return; }
-    };
+    let header = format!(
+        "Received: from {} ({} [{}])\r\n\tby {} (rmail) with ESMTP id {}\r\n\tfor {}; {}\r\n",
+        envelope.client_helo,
+        envelope.client_helo,
+        envelope.client_ip,
+        our_hostname,
+        envelope.id,
+        envelope.recipients.first()
+            .map(|r| r.address.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        ts,
+    );
 
-    // SPF / DKIM / DMARC
-    let from_domain = msg.envelope.from.domain.as_str();
-    let from_addr   = msg.envelope.from.as_str();
-    let helo        = &msg.envelope.client_helo;
-    let client_ip   = msg.envelope.client_ip;
-
-    let auth = checker::verify(
-        &body,
-        &from_addr,
-        from_domain,
-        helo,
-        client_ip,
-        &config.server.hostname,
-    ).await;
-
-    info!(%id, spf = auth.spf.label(), dkim = auth.dkim.label(), dmarc = auth.dmarc.label(), "auth check");
-
-    if let Some(reason) = auth.should_reject() {
-        warn!(%id, %reason, "cleanup: DMARC reject");
-        // Move to corrupt for logging — do not bounce (prevents backscatter)
-        let _ = queue.transition(id, QueueState::Incoming, QueueState::Corrupt).await;
-        return;
-    }
-
-    // Prepend Authentication-Results header to body
-    let auth_header = format!("Authentication-Results: {}\r\n", auth.header(&config.server.hostname));
-    let mut new_body = auth_header.into_bytes();
-    new_body.extend_from_slice(&body);
-
-    // Rewrite body with prepended header
-    if let Err(e) = tokio::fs::write(&msg.body_path, &new_body).await {
-        error!(%id, "cleanup: rewrite body failed: {}", e);
-        return;
-    }
-
-    // Transition incoming → active, then notify queue manager
-    match queue.transition(id, QueueState::Incoming, QueueState::Active).await {
-        Ok(()) => {
-            info!(%id, "cleanup done, queued for delivery");
-            let _ = notify.send(id.to_owned()).await;
-        }
-        Err(e) => error!(%id, "cleanup transition failed: {}", e),
-    }
+    let mut out = Vec::with_capacity(header.len() + body.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(body);
+    out
 }

@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-rmail-config  = { path = "../config" }
-tokio         = { workspace = true }
-tokio-rustls  = { workspace = true }
-rustls        = { workspace = true }
+rmail-config   = { path = "../config" }
+tokio          = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls         = { workspace = true }
 rustls-pemfile = { workspace = true }
-tracing       = { workspace = true }
-thiserror     = { workspace = true }
+webpki-roots   = "0.26"
+tracing        = { workspace = true }
+thiserror      = { workspace = true }

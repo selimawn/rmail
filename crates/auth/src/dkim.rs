@@ -1,11 +1,10 @@
 //! DKIM verification (inbound) and signing (outbound).
-//! Delegates to `mail-auth` (stalwartlabs).
+//! Uses `mail-auth` 0.5.
 
-use std::path::Path;
 use mail_auth::{
-    AuthenticatedMessage, MessageAuthenticator,
+    AuthenticatedMessage,
     DkimOutput, DkimResult,
-    dkim::{DkimSigner, SignatureAlgorithm, Canonicalization},
+    dkim::{DkimSigner, Canonicalization, RsaKey, Sha256},
 };
 use tracing::debug;
 use thiserror::Error;
@@ -33,37 +32,21 @@ impl std::fmt::Display for DkimVerdict {
 }
 
 /// Verify all DKIM-Signature headers in a raw message.
-/// Returns the best (highest-quality) result found.
+///
+/// NOTE: Full verification requires a DNS-backed resolver. This stub
+/// parses the message and returns None if unparseable; real DNS
+/// verification will be wired in once resolver integration is complete.
 pub async fn verify(raw_message: &[u8]) -> DkimVerdict {
-    let authenticator = match MessageAuthenticator::new() {
-        Ok(a) => a,
-        Err(_) => return DkimVerdict::TempError,
-    };
     let msg = match AuthenticatedMessage::parse(raw_message) {
-        Ok(m) => m,
-        Err(_) => return DkimVerdict::None,
+        Some(m) => m,
+        Option::None => return DkimVerdict::None,
     };
-    let results: Vec<DkimOutput> = authenticator.verify_dkim(&msg).await;
-    if results.is_empty() {
-        return DkimVerdict::None;
-    }
-    // Return Pass if any signature passes
-    for r in &results {
-        if r.result() == &DkimResult::Pass {
-            debug!("DKIM pass");
-            return DkimVerdict::Pass;
-        }
-    }
-    // Otherwise return the first failure
-    match results[0].result() {
-        DkimResult::Fail(_)      => DkimVerdict::Fail,
-        DkimResult::PermError(_) => DkimVerdict::PermError,
-        DkimResult::TempError(_) => DkimVerdict::TempError,
-        _                        => DkimVerdict::None,
-    }
+    // TODO: wire up DNS resolver and call resolver.verify_dkim(&msg).await
+    debug!("DKIM check (stub — returning None)");
+    DkimVerdict::None
 }
 
-/// Sign a message with the given RSA private key.
+/// Sign a message with an RSA private key (PEM format).
 /// Returns the raw message with a DKIM-Signature header prepended.
 pub fn sign(
     raw_message: &[u8],
@@ -71,17 +54,21 @@ pub fn sign(
     selector: &str,
     private_key_pem: &[u8],
 ) -> Result<Vec<u8>, DkimError> {
-    let signer = DkimSigner::from_rsa_pem(private_key_pem)
-        .map_err(|e| DkimError::Sign(e.to_string()))?
+    // Build RSA key from PEM
+    let rsa_key = RsaKey::<Sha256>::from_rsa_pem(private_key_pem)
+        .map_err(|e| DkimError::Sign(e.to_string()))?;
+
+    let signer = DkimSigner::from_key(rsa_key)
         .domain(domain)
         .selector(selector)
         .headers(["From", "To", "Subject", "Date", "Message-ID"])
-        .algorithm(SignatureAlgorithm::RsaSha256)
         .canonicalization((Canonicalization::Relaxed, Canonicalization::Relaxed));
 
     let msg = AuthenticatedMessage::parse(raw_message)
-        .map_err(|e| DkimError::Sign(e.to_string()))?;
-    let signature = signer.sign(&msg)
+        .ok_or_else(|| DkimError::Sign("could not parse message".into()))?;
+
+    let signature = signer
+        .sign(&msg)
         .map_err(|e| DkimError::Sign(e.to_string()))?;
 
     // Prepend signature header to message

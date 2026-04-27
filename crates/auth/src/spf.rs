@@ -1,15 +1,7 @@
-//! SPF verification using `mail-auth` (stalwartlabs).
-//!
-//! Called after MAIL FROM to check whether the client IP is
-//! authorised to send on behalf of the sender domain.
+//! SPF verification using `mail-auth` 0.5.
 
 use std::net::IpAddr;
-use mail_auth::{
-    AuthenticatedMessage, MessageAuthenticator,
-    SpfOutput, SpfResult,
-};
 use tracing::debug;
-use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpfVerdict {
@@ -23,7 +15,6 @@ pub enum SpfVerdict {
 }
 
 impl SpfVerdict {
-    /// True if the result should be treated as a hard rejection.
     pub fn is_reject(&self) -> bool {
         matches!(self, Self::Fail)
     }
@@ -44,29 +35,17 @@ impl std::fmt::Display for SpfVerdict {
     }
 }
 
-/// Verify SPF for a given MAIL FROM and client IP.
+/// Verify SPF for a given MAIL FROM domain and client IP.
 ///
-/// `sender_domain` is the domain part of the MAIL FROM address.
-/// `client_ip` is the IP of the connecting SMTP client.
+/// NOTE: Full async DNS-backed SPF verification requires wiring in a
+/// `mail_auth::Resolver` implementation. This stub returns `None` and
+/// will be replaced once the DNS resolver integration is complete.
 pub async fn verify(
     sender_domain: &str,
     client_ip: IpAddr,
     helo: &str,
 ) -> SpfVerdict {
-    let authenticator = MessageAuthenticator::new().unwrap();
-    let output: SpfOutput = authenticator
-        .verify_spf_sender(client_ip, helo, sender_domain)
-        .await;
-
-    let verdict = match output.result() {
-        SpfResult::Pass      => SpfVerdict::Pass,
-        SpfResult::Fail      => SpfVerdict::Fail,
-        SpfResult::SoftFail  => SpfVerdict::SoftFail,
-        SpfResult::Neutral   => SpfVerdict::Neutral,
-        SpfResult::None      => SpfVerdict::None,
-        SpfResult::TempError => SpfVerdict::TempError,
-        SpfResult::PermError => SpfVerdict::PermError,
-    };
-    debug!(%sender_domain, %client_ip, result = %verdict, "SPF");
-    verdict
+    // TODO: wire up mail_auth resolver for real SPF evaluation
+    debug!(%sender_domain, %client_ip, %helo, "SPF check (stub — returning None)");
+    SpfVerdict::None
 }

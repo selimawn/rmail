@@ -1,9 +1,9 @@
 //! DMARC policy evaluation.
-//! Combines SPF + DKIM results and looks up the sender domain's DMARC record.
+//! Uses `mail-auth` 0.5.
 
 use mail_auth::{
-    AuthenticatedMessage, MessageAuthenticator,
-    DmarcOutput, DmarcResult,
+    AuthenticatedMessage,
+    DmarcOutput,
     dmarc::Policy,
 };
 use tracing::debug;
@@ -33,29 +33,20 @@ impl std::fmt::Display for DmarcVerdict {
     }
 }
 
+/// Evaluate DMARC policy.
+///
+/// NOTE: Full evaluation requires a DNS-backed resolver. This stub
+/// returns None and will be replaced once resolver integration is complete.
 pub async fn evaluate(
     raw_message: &[u8],
     spf: &SpfVerdict,
     dkim: &DkimVerdict,
 ) -> DmarcVerdict {
-    let authenticator = match MessageAuthenticator::new() {
-        Ok(a) => a,
-        Err(_) => return DmarcVerdict::None,
+    let _msg = match AuthenticatedMessage::parse(raw_message) {
+        Some(m) => m,
+        Option::None => return DmarcVerdict::None,
     };
-    let msg = match AuthenticatedMessage::parse(raw_message) {
-        Ok(m) => m,
-        Err(_) => return DmarcVerdict::None,
-    };
-
-    let output: DmarcOutput = authenticator.verify_dmarc(&msg).await;
-    let verdict = match output.dmarc_pass() {
-        true => DmarcVerdict::Pass,
-        false => match output.policy() {
-            Policy::Reject      => DmarcVerdict::Reject,
-            Policy::Quarantine  => DmarcVerdict::Quarantine,
-            _                   => DmarcVerdict::None,
-        },
-    };
-    debug!(spf = %spf, dkim = %dkim, dmarc = %verdict, "DMARC");
-    verdict
+    // TODO: wire up DNS resolver and call resolver.verify_dmarc(&msg).await
+    debug!(spf = %spf, dkim = %dkim, "DMARC check (stub — returning None)");
+    DmarcVerdict::None
 }

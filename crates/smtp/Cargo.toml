@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 rmail-core   = { path = "../core" }
 rmail-config = { path = "../config" }
+rmail-auth   = { path = "../auth" }
 nom          = { workspace = true }
 bytes        = { workspace = true }
 tokio        = { workspace = true }

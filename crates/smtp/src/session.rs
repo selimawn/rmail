@@ -5,7 +5,7 @@
 //! socket. When `step()` returns `Action::Close`, flush and drop.
 
 use std::net::IpAddr;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use rmail_core::{Address, Envelope};
 use rmail_config::Config;
 use crate::command::{self, Command};
@@ -16,7 +16,8 @@ const MAX_LINE: usize = 1000;
 /// Maximum number of RCPT TO per message (anti-abuse).
 const MAX_RCPTS: usize = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Note: Copy removed because AuthLoginPass variant contains a String.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
     /// Accepted TCP connection, banner sent, waiting for EHLO/HELO.
     Connected,
@@ -59,12 +60,9 @@ pub struct Session {
     helo: String,
     tls_active: bool,
     auth_user: Option<String>,
-    // Accumulator for MAIL FROM / RCPT TO across a single transaction.
     from: Option<Address>,
     rcpts: Vec<Address>,
-    // DATA accumulator (streamed; we flush to disk via the Enqueue action).
     body_buf: Vec<u8>,
-    // Track whether SIZE was announced and what limit applies.
     max_size: u64,
 }
 
@@ -88,16 +86,14 @@ impl Session {
     }
 
     /// Feed a line from the client. Returns what to do next.
-    /// In `Data` state, `line` is a raw body line (not a command).
     pub fn step(&mut self, line: &[u8], config: &Config) -> Action {
         if line.len() > MAX_LINE && self.state != State::Data {
             return Action::Close(Reply::syntax_error().to_wire());
         }
 
-        match self.state {
+        match &self.state {
             State::Data => self.handle_data_line(line, config),
-            State::AuthLoginPass { ref username } => {
-                // Expect base64-encoded password
+            State::AuthLoginPass { username } => {
                 let user = username.clone();
                 self.handle_auth_login_pass(line, &user, config)
             }
@@ -141,7 +137,7 @@ impl Session {
             Reply::ehlo_caps(
                 &config.server.hostname,
                 config.max_message_bytes(),
-                !self.tls_active, // advertise STARTTLS only before upgrade
+                !self.tls_active,
             )
             .to_wire(),
         )
@@ -154,11 +150,10 @@ impl Session {
         Action::UpgradeTls(Reply::start_tls().to_wire())
     }
 
-    fn do_mail_from(&mut self, address: String, size: Option<u64>, config: &Config) -> Action {
+    fn do_mail_from(&mut self, address: String, size: Option<u64>, _config: &Config) -> Action {
         if !matches!(self.state, State::Greeted | State::Tls) {
             return Action::Reply(Reply::bad_sequence().to_wire());
         }
-        // Size check (if client announced one)
         if let Some(sz) = size {
             if sz > self.max_size {
                 return Action::Reply(Reply::message_too_large().to_wire());
@@ -185,14 +180,11 @@ impl Session {
             Ok(a) => a,
             Err(_) => return Action::Reply(Reply::new(501, "5.1.3 Bad recipient address syntax").to_wire()),
         };
-        // Relay check: only accept mail for local domains on port 25
         if !config.is_local_domain(&addr.domain) {
-            // Authenticated users may relay
             if self.auth_user.is_none() {
                 return Action::Reply(Reply::relay_denied().to_wire());
             }
         } else {
-            // Local domain: user must exist
             if config.find_user(&addr.as_str()).is_none() {
                 return Action::Reply(Reply::user_unknown(&addr.as_str()).to_wire());
             }
@@ -219,29 +211,24 @@ impl Session {
 
     // ─── DATA body accumulation ───────────────────────────────────────────────
 
-    fn handle_data_line(&mut self, line: &[u8], config: &Config) -> Action {
-        // End-of-data marker: a line containing only a dot
+    fn handle_data_line(&mut self, line: &[u8], _config: &Config) -> Action {
         if line == b".\r\n" || line == b".\n" || line == b"." {
-            return self.finalize_data(config);
+            return self.finalize_data();
         }
-        // Dot-stuffing: leading `..` → `.`
         let line = if line.starts_with(b"..") { &line[1..] } else { line };
-
-        // Size guard
         if self.body_buf.len() + line.len() > self.max_size as usize {
             self.reset_transaction();
             self.state = State::Greeted;
             return Action::Reply(Reply::message_too_large().to_wire());
         }
         self.body_buf.extend_from_slice(line);
-        Action::Reply(vec![]) // no reply mid-data
+        Action::Reply(vec![])
     }
 
-    fn finalize_data(&mut self, config: &Config) -> Action {
-        let from = self.from.take().unwrap_or_else(Address::null);
+    fn finalize_data(&mut self) -> Action {
+        let from  = self.from.take().unwrap_or_else(Address::null);
         let rcpts = std::mem::take(&mut self.rcpts);
         let body  = std::mem::take(&mut self.body_buf);
-
         let envelope = Envelope::new(
             from,
             rcpts,
@@ -275,27 +262,20 @@ impl Session {
     }
 
     fn do_auth_login(&mut self) -> Action {
-        // Ask for username in base64
         self.state = State::AuthLoginPass { username: String::new() };
-        // First challenge: "Username:"
         Action::Reply(Reply::auth_continue("VXNlcm5hbWU6").to_wire())
     }
 
     fn handle_auth_login_pass(&mut self, line: &[u8], username_b64: &str, config: &Config) -> Action {
-        // First response is the username in base64; state hack: we store it in the enum
-        // username_b64 is empty on first call → this is the username
         let line_str = std::str::from_utf8(line).unwrap_or("").trim();
         if username_b64.is_empty() {
-            // Got username, ask for password
             self.state = State::AuthLoginPass { username: line_str.to_owned() };
-            return Action::Reply(Reply::auth_continue("UGFzc3dvcmQ6").to_wire()); // "Password:"
+            return Action::Reply(Reply::auth_continue("UGFzc3dvcmQ6").to_wire());
         }
-        // Got password — verify
-        // username_b64 holds the base64 username; decode both
         let user = decode_b64(username_b64);
         let pass = decode_b64(line_str);
         if let Some(u) = config.find_user(&user) {
-            if verify_argon2(&pass, &u.password_hash) {
+            if rmail_auth::password::verify(&pass, &u.password_hash) {
                 self.auth_user = Some(user);
                 self.state = State::Greeted;
                 return Action::Reply(Reply::auth_ok().to_wire());
@@ -308,7 +288,7 @@ impl Session {
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     fn reset_transaction(&mut self) {
-        self.from  = None;
+        self.from = None;
         self.rcpts.clear();
         self.body_buf.clear();
     }
@@ -317,26 +297,20 @@ impl Session {
         self.state == State::Closed
     }
 
-    /// Called by TLS layer after upgrade completes.
     pub fn mark_tls_active(&mut self) {
         self.tls_active = true;
-        self.state = State::Connected; // client will re-EHLO
+        self.state = State::Connected;
     }
 }
 
 // ─── auth helpers ────────────────────────────────────────────────────────────
 
 fn decode_b64(s: &str) -> String {
-    use std::io::Read;
-    // base64 decode; ignore errors → empty string
     let bytes = base64_decode(s.trim());
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {
-    // Simple base64 decode without pulling in another dep
-    // We already have `base64 = "0.22"` in workspace
-    use std::collections::HashMap;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut map = [255u8; 256];
     for (i, &c) in ALPHABET.iter().enumerate() { map[c as usize] = i as u8; }
@@ -361,24 +335,14 @@ fn base64_decode(s: &str) -> Vec<u8> {
 /// Verify AUTH PLAIN blob: `\0user\0password` (base64-encoded).
 fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
     let raw = base64_decode(blob);
-    // Format: [authzid] NUL authcid NUL passwd
     let parts: Vec<&[u8]> = raw.splitn(3, |&b| b == 0).collect();
     if parts.len() < 3 { return None; }
     let user = std::str::from_utf8(parts[1]).ok()?;
     let pass = std::str::from_utf8(parts[2]).ok()?;
     let cfg_user = config.find_user(user)?;
-    if verify_argon2(pass, &cfg_user.password_hash) {
+    if rmail_auth::password::verify(pass, &cfg_user.password_hash) {
         Some(user.to_owned())
     } else {
         None
     }
-}
-
-fn verify_argon2(password: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let parsed = match PasswordHash::new(hash) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
 }

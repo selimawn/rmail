@@ -15,16 +15,21 @@
 //! - `<id>.env` — bincode-encoded `Envelope`
 //! - `<id>.eml` — raw RFC 5322 bytes (dot-stuffing decoded)
 //!
-//! State transitions are atomic `rename(2)` calls per file. The two-file
-//! design means a transition is *not* atomic across both files: a crash
-//! between the two renames leaves split halves in different directories.
-//! [`Queue::new`] runs an orphan reconciliation pass at startup that moves
-//! any unmatched halves into `corrupt/` for manual inspection.
+//! ## Crash semantics
+//!
+//! State transitions are atomic `rename(2)` calls. Within a transition the
+//! body is renamed first and the envelope second — the **envelope is the
+//! commit marker**. After every mutation the parent directory is fsynced so
+//! the rename is durable across kernel crashes.
+//!
+//! On startup, [`Queue::recover`] sweeps every directory: orphan `.eml`
+//! files (a partial transition) are deleted, envelopes without a body are
+//! quarantined into `corrupt/`.
 
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use thiserror::Error;
 use rmail_core::{Envelope, Message, QueueState};
 
@@ -41,8 +46,7 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Create a Queue handle, ensure all subdirectories exist, and reconcile
-    /// any orphan files left behind by a previous crash mid-transition.
+    /// Create a Queue handle and ensure all subdirectories exist.
     pub async fn new(root: PathBuf) -> Result<Self, QueueError> {
         for state in [
             QueueState::Incoming,
@@ -54,9 +58,7 @@ impl Queue {
         ] {
             fs::create_dir_all(root.join(state.dir_name())).await?;
         }
-        let queue = Self { root };
-        queue.reconcile_orphans().await?;
-        Ok(queue)
+        Ok(Self { root })
     }
 
     fn dir(&self, state: QueueState) -> PathBuf {
@@ -71,12 +73,11 @@ impl Queue {
         self.dir(state).join(format!("{}.eml", id))
     }
 
-    // ─── Enqueue ───────────────────────────────────────────────────────────────────
+    // ─── Enqueue ─────────────────────────────────────────────────────────────
 
     /// Accept a message into `incoming/`.
-    /// Writes body, then envelope, then fsyncs the directory so the names
-    /// are durable on POSIX. An accepted message survives a crash.
-    /// Returns the message ID (= `envelope.id`).
+    /// Body first, envelope second, then directory fsync. After this returns
+    /// Ok the message is durable: a kernel crash cannot lose it.
     pub async fn enqueue(
         &self,
         envelope: Envelope,
@@ -84,15 +85,16 @@ impl Queue {
     ) -> Result<String, QueueError> {
         let id = envelope.id.to_string();
         debug!(%id, bytes = body.len(), "enqueue");
+        let incoming = self.dir(QueueState::Incoming);
 
-        // 1. Body
+        // 1. Write body, fsync data
         let eml = self.eml_path(QueueState::Incoming, &id);
         let mut f = fs::File::create(&eml).await?;
         f.write_all(body).await?;
         f.sync_data().await?;
         drop(f);
 
-        // 2. Envelope
+        // 2. Write envelope (commit marker), fsync data
         let env_bytes = bincode::serialize(&envelope)?;
         let env = self.env_path(QueueState::Incoming, &id);
         let mut f = fs::File::create(&env).await?;
@@ -100,22 +102,23 @@ impl Queue {
         f.sync_data().await?;
         drop(f);
 
-        // 3. fsync the directory so the entries are durable.
-        if let Err(e) = fsync_dir(&self.dir(QueueState::Incoming)).await {
-            warn!(%id, "fsync of incoming/ failed (message accepted but not durable): {}", e);
-        }
+        // 3. Fsync directory so both new entries are durable
+        fsync_dir(&incoming).await?;
 
         Ok(id)
     }
 
-    // ─── State transitions ───────────────────────────────────────────────────────────────────
+    // ─── State transitions ───────────────────────────────────────────────────────
 
-    /// Move a message from one state directory to another.
+    /// Atomically move a message from one state directory to another.
     ///
-    /// Renames `.env` then `.eml`. A crash between the two renames leaves
-    /// the two halves split across directories; these split halves are
-    /// caught and quarantined by [`Queue::new`]'s orphan reconciliation
-    /// pass at the next startup.
+    /// Order: `.eml` first, `.env` second. The envelope is the commit
+    /// marker — if its presence in a directory implies the body is also
+    /// there. If we crash between the two renames:
+    ///   - body is in the destination dir (orphan, picked up by `recover`)
+    ///   - envelope is still in the source dir (message remains in old state)
+    ///
+    /// Both directories are fsynced before returning.
     pub async fn transition(
         &self,
         id: &str,
@@ -123,12 +126,17 @@ impl Queue {
         to: QueueState,
     ) -> Result<(), QueueError> {
         debug!(%id, from = from.dir_name(), to = to.dir_name(), "queue transition");
-        fs::rename(self.env_path(from, id), self.env_path(to, id)).await?;
+        // Body first
         fs::rename(self.eml_path(from, id), self.eml_path(to, id)).await?;
+        // Envelope second (= commit marker)
+        fs::rename(self.env_path(from, id), self.env_path(to, id)).await?;
+        // Make both dir entries durable
+        fsync_dir(&self.dir(from)).await?;
+        fsync_dir(&self.dir(to)).await?;
         Ok(())
     }
 
-    // ─── Load ────────────────────────────────────────────────────────────────────────────
+    // ─── Load ────────────────────────────────────────────────────────────────────
 
     /// Load a message from a queue directory.
     pub async fn load(&self, state: QueueState, id: &str) -> Result<Message, QueueError> {
@@ -140,10 +148,10 @@ impl Queue {
         Ok(Message { envelope, body_path: eml_path, size })
     }
 
-    // ─── Update envelope ────────────────────────────────────────────────────────────────────
+    // ─── Update envelope ─────────────────────────────────────────────────────────
 
     /// Rewrite the envelope in-place after updating delivery status.
-    /// Uses tmp file + rename for atomicity.
+    /// Tmp file + rename for atomicity, then dir fsync.
     pub async fn update_envelope(
         &self,
         state: QueueState,
@@ -158,10 +166,11 @@ impl Queue {
         f.sync_data().await?;
         drop(f);
         fs::rename(&tmp, &path).await?;
+        fsync_dir(&self.dir(state)).await?;
         Ok(())
     }
 
-    // ─── List ────────────────────────────────────────────────────────────────────────────
+    // ─── List ────────────────────────────────────────────────────────────────────
 
     /// List all message IDs present in a queue state directory.
     pub async fn list(&self, state: QueueState) -> Result<Vec<String>, QueueError> {
@@ -181,7 +190,7 @@ impl Queue {
         Ok(ids)
     }
 
-    // ─── Remove ───────────────────────────────────────────────────────────────────────
+    // ─── Remove ──────────────────────────────────────────────────────────────────
 
     /// Delete both files for a message (called after successful delivery).
     pub async fn remove(&self, state: QueueState, id: &str) -> Result<(), QueueError> {
@@ -191,16 +200,26 @@ impl Queue {
         if let Err(e) = fs::remove_file(self.eml_path(state, id)).await {
             warn!(%id, "could not remove .eml: {}", e);
         }
+        let _ = fsync_dir(&self.dir(state)).await;
         Ok(())
     }
 
-    // ─── Orphan reconciliation ────────────────────────────────────────────────────────────────────
+    // ─── Recovery ─────────────────────────────────────────────────────────────────
 
-    /// Scan every working state dir for files without their counterpart and
-    /// move them to `corrupt/`. Recovers from a crash mid-transition.
-    /// `corrupt/` itself is intentionally not scanned.
-    async fn reconcile_orphans(&self) -> Result<(), QueueError> {
-        use std::collections::HashSet;
+    /// Walk every queue directory and reconcile inconsistent state left by a
+    /// crash. Call **once** at startup before any other queue activity.
+    ///
+    /// Two cases handled:
+    ///   1. `.eml` without matching `.env` in the same dir
+    ///      → orphan body left by a partial `transition`. The envelope (the
+    ///        source of truth) is still in the source dir and will be picked
+    ///        up on the next pass. The orphan body is deleted.
+    ///   2. `.env` without matching `.eml` in the same dir
+    ///      → envelope claims a message we cannot find. Quarantine it into
+    ///        `corrupt/` for human inspection.
+    pub async fn recover(&self) -> Result<RecoveryReport, QueueError> {
+        let mut report = RecoveryReport::default();
+
         for state in [
             QueueState::Incoming,
             QueueState::Active,
@@ -209,76 +228,71 @@ impl Queue {
             QueueState::Bounce,
         ] {
             let dir = self.dir(state);
-            let mut envs: HashSet<String> = HashSet::new();
-            let mut emls: HashSet<String> = HashSet::new();
+            let mut envs = Vec::new();
+            let mut emls = Vec::new();
+
             let mut rd = match fs::read_dir(&dir).await {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
             while let Some(entry) = rd.next_entry().await? {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
-                if let Some(id) = s.strip_suffix(".env") {
-                    envs.insert(id.to_owned());
-                } else if let Some(id) = s.strip_suffix(".eml") {
-                    emls.insert(id.to_owned());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(id) = name.strip_suffix(".env") {
+                    envs.push(id.to_owned());
+                } else if let Some(id) = name.strip_suffix(".eml") {
+                    emls.push(id.to_owned());
                 }
             }
-            for id in envs.difference(&emls) {
-                warn!(
-                    %id, dir = state.dir_name(),
-                    "orphan .env (no matching .eml); moving to corrupt/"
-                );
-                if let Err(e) = fs::rename(
-                    self.env_path(state, id),
-                    self.env_path(QueueState::Corrupt, id),
-                ).await {
-                    warn!(%id, "failed to move orphan .env to corrupt/: {}", e);
+
+            // Case 1: orphan bodies
+            for id in &emls {
+                if !envs.contains(id) {
+                    warn!(%id, dir = state.dir_name(), "orphan body removed during recovery");
+                    let _ = fs::remove_file(self.eml_path(state, id)).await;
+                    report.orphan_bodies_removed += 1;
                 }
             }
-            for id in emls.difference(&envs) {
-                warn!(
-                    %id, dir = state.dir_name(),
-                    "orphan .eml (no matching .env); moving to corrupt/"
-                );
-                if let Err(e) = fs::rename(
-                    self.eml_path(state, id),
-                    self.eml_path(QueueState::Corrupt, id),
-                ).await {
-                    warn!(%id, "failed to move orphan .eml to corrupt/: {}", e);
+
+            // Case 2: envelopes without bodies
+            for id in &envs {
+                if !emls.contains(id) {
+                    warn!(%id, dir = state.dir_name(), "envelope without body, quarantining");
+                    let _ = fs::rename(
+                        self.env_path(state, id),
+                        self.env_path(QueueState::Corrupt, id),
+                    ).await;
+                    report.corrupt_envelopes += 1;
                 }
             }
+
+            let _ = fsync_dir(&dir).await;
         }
-        Ok(())
+        let _ = fsync_dir(&self.dir(QueueState::Corrupt)).await;
+
+        info!(
+            orphan_bodies = report.orphan_bodies_removed,
+            corrupt = report.corrupt_envelopes,
+            "queue recovery complete"
+        );
+        Ok(report)
     }
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────────────
+/// Result of a [`Queue::recover`] sweep.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RecoveryReport {
+    pub orphan_bodies_removed: usize,
+    pub corrupt_envelopes: usize,
+}
 
-/// fsync a directory (POSIX). On non-Unix targets this is a no-op.
-///
-/// Uses `spawn_blocking` + `std::fs::File` because tokio's async file API
-/// is documented for files only. `sync_all` on a directory fd flushes the
-/// directory's metadata (the names of contained files) on Linux/BSD.
+// ─── helpers ──────────────────────────────────────────────────────────────────────
+
+/// fsync(2) the directory file descriptor so that recent rename/create/unlink
+/// operations are durable. On most Unix filesystems, fsyncing a file is not
+/// sufficient — the parent directory entry must be fsynced too.
 async fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let path = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let f = std::fs::File::open(&path)?;
-            f.sync_all()?;
-            Ok(())
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    let f = fs::File::open(path).await?;
+    f.sync_all().await?;
+    Ok(())
 }

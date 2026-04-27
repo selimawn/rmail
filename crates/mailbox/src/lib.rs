@@ -12,12 +12,14 @@
 //! └── .Junk/{cur,new,tmp}
 //! ```
 //!
-//! One file = one message. Lock-free thanks to atomic `rename(2)` from `tmp/` to `new/`.
+//! One file = one message. Lock-free thanks to atomic `rename(2)` from
+//! `tmp/` to `new/`. Every state-changing rename is followed by a parent-
+//! directory fsync so the change is durable across kernel crashes.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use thiserror::Error;
 use rmail_core::Address;
 
@@ -54,7 +56,7 @@ impl Maildir {
         }
     }
 
-    // ─── Provisioning ─────────────────────────────────────────────────────────────────────
+    // ─── Provisioning ─────────────────────────────────────────────────────────────
 
     /// Create the full Maildir++ structure for a new user.
     pub async fn create_user(&self, address: &Address) -> Result<(), MailboxError> {
@@ -75,16 +77,13 @@ impl Maildir {
         self.user_dir(address).join("cur").exists()
     }
 
-    // ─── Delivery ──────────────────────────────────────────────────────────────────────
+    // ─── Delivery ──────────────────────────────────────────────────────────────────
 
     /// Deliver a raw RFC 5322 message to the user's INBOX.
     ///
-    /// Steps:
-    /// 1. Write to `tmp/<unique>` and fsync the file.
+    /// 1. Write to `tmp/<unique>` and fsync.
     /// 2. `rename(tmp/<unique>, new/<unique>)` — atomic.
-    /// 3. fsync `new/` so the directory entry is durable.
-    ///
-    /// Returns the Maildir filename.
+    /// 3. Fsync `new/` so the rename is durable.
     pub async fn deliver(
         &self,
         address: &Address,
@@ -98,7 +97,6 @@ impl Maildir {
         let filename = unique_filename();
         let tmp_path = base.join("tmp").join(&filename);
         let new_path = base.join("new").join(&filename);
-        let new_dir  = base.join("new");
 
         tokio::fs::write(&tmp_path, body).await?;
         {
@@ -106,15 +104,13 @@ impl Maildir {
             f.sync_data().await?;
         }
         tokio::fs::rename(&tmp_path, &new_path).await?;
-        if let Err(e) = fsync_dir(&new_dir).await {
-            warn!(address = %address, file = %filename, "fsync of new/ failed: {}", e);
-        }
+        let _ = fsync_dir(&base.join("new")).await;
 
         debug!(address = %address, file = %filename, bytes = body.len(), "delivered");
         Ok(filename)
     }
 
-    // ─── List ────────────────────────────────────────────────────────────────────────────
+    // ─── List ─────────────────────────────────────────────────────────────────────────
 
     /// List all messages in a folder (both `cur/` and `new/`).
     pub async fn list_messages(
@@ -164,22 +160,24 @@ impl Maildir {
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') && entry.metadata().await?.is_dir() {
+                // Strip leading dot for display (`.Sent` → `Sent`)
                 folders.push(name[1..].to_owned());
             }
         }
         Ok(folders)
     }
 
-    // ─── Read ────────────────────────────────────────────────────────────────────────────
+    // ─── Read ────────────────────────────────────────────────────────────────────
 
     pub async fn read_message(&self, path: &PathBuf) -> Result<Vec<u8>, MailboxError> {
         Ok(tokio::fs::read(path).await?)
     }
 
-    // ─── Move to cur (IMAP "seen") ─────────────────────────────────────────────────────────────
+    // ─── Move to cur (IMAP "seen") ─────────────────────────────────────────────────────
 
     /// Move a message from `new/` to `cur/` when IMAP selects the mailbox.
-    /// Appends `:2,S` flags to the filename.
+    /// Appends `:2,S` flags to the filename. The `cur/` directory is fsynced
+    /// so the rename survives a crash.
     pub async fn move_to_cur(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
         let filename = path.file_name().unwrap().to_string_lossy();
         let new_name = if filename.contains(":2,") {
@@ -190,28 +188,35 @@ impl Maildir {
         let cur_dir = path.parent().unwrap().parent().unwrap().join("cur");
         let new_path = cur_dir.join(&new_name);
         tokio::fs::rename(path, &new_path).await?;
+        let _ = fsync_dir(&cur_dir).await;
         Ok(new_path)
     }
 
-    // ─── Expunge / delete ─────────────────────────────────────────────────────────────────
+    // ─── Expunge / delete ────────────────────────────────────────────────────────────
 
     /// Mark a message as deleted by adding the T flag.
     pub async fn mark_deleted(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
         let filename = path.file_name().unwrap().to_string_lossy();
         let new_name = add_flag(&filename, 'T');
-        let new_path = path.parent().unwrap().join(&new_name);
+        let parent = path.parent().unwrap().to_owned();
+        let new_path = parent.join(&new_name);
         tokio::fs::rename(path, &new_path).await?;
+        let _ = fsync_dir(&parent).await;
         Ok(new_path)
     }
 
     /// Permanently remove a message file (called on EXPUNGE).
     pub async fn expunge(&self, path: &PathBuf) -> Result<(), MailboxError> {
+        let parent = path.parent().map(|p| p.to_owned());
         tokio::fs::remove_file(path).await?;
+        if let Some(p) = parent {
+            let _ = fsync_dir(&p).await;
+        }
         Ok(())
     }
 }
 
-// ─── Types ─────────────────────────────────────────────────────────────────────────
+// ─── Types ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct MaildirEntry {
@@ -223,7 +228,7 @@ pub struct MaildirEntry {
     pub deleted:  bool,
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Generate a unique Maildir filename.
 /// Format: `<timestamp>.<pid>_<counter>.rmail`
@@ -264,25 +269,11 @@ fn add_flag(filename: &str, flag: char) -> String {
     }
 }
 
-/// fsync a directory (POSIX). On non-Unix targets this is a no-op.
+/// fsync(2) a directory so that recent rename/create/unlink operations are
+/// durable. On Unix filesystems, file fsync alone is not sufficient for
+/// directory entry persistence.
 async fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let path = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let f = std::fs::File::open(&path)?;
-            f.sync_all()?;
-            Ok(())
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    let f = fs::File::open(path).await?;
+    f.sync_all().await?;
+    Ok(())
 }

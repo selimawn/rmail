@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use thiserror::Error;
 
-// ─── QueueId ─────────────────────────────────────────────────────────────────────
+// ─── QueueId ──────────────────────────────────────────────────────────────────────
 
 /// Unique identifier for a queued message.
 /// Format: `YYYYMMDDHHmmss.XXXXXX` (hex entropy from pid + nanoseconds).
@@ -44,9 +44,13 @@ impl fmt::Display for QueueId {
     }
 }
 
-// ─── Address ─────────────────────────────────────────────────────────────────────
+// ─── Address ──────────────────────────────────────────────────────────────────────
 
 /// A parsed RFC 5321 email address.
+///
+/// **Normalisation**: both `local` and `domain` are stored lowercased.
+/// RFC 5321 §2.4 permits a case-sensitive local-part, but every modern MTA
+/// treats it case-insensitively in practice. We do the same.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Address {
     pub local: String,
@@ -54,31 +58,35 @@ pub struct Address {
 }
 
 impl Address {
-    /// Parse from `<user@domain>` or bare `user@domain`.
-    /// An empty/null address `<>` returns `Address::null()`.
+    /// Parse from `<user@domain>` or `user@domain`.
     ///
-    /// Strict: exactly one matched pair of angle brackets is allowed, or
-    /// none at all. Inputs like `<<a@b>>`, `<a@b`, or `a@b>` are rejected.
-    /// Both local-part and domain must be non-empty for a non-null address.
+    /// Accepts at most one matching pair of angle brackets. Unbalanced or
+    /// nested brackets, empty local-part or domain, or strings with no `@`
+    /// are all rejected. The empty/null address `<>` (or just whitespace
+    /// inside brackets) returns [`Address::null`].
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let s = s.trim();
+        // Accept exactly one optional pair of angle brackets, no nesting.
         let inner = match (s.starts_with('<'), s.ends_with('>')) {
-            (true, true)   => &s[1..s.len() - 1],
+            (true, true) => &s[1..s.len() - 1],
             (false, false) => s,
-            _              => return Err(CoreError::InvalidAddress(s.to_owned())),
+            _ => return Err(CoreError::InvalidAddress(s.to_owned())),
         };
         let inner = inner.trim();
         if inner.is_empty() {
             return Ok(Self::null());
         }
+        // Catch nested brackets such as `<<a@b>>` or `<a<b>@c>`.
         if inner.contains('<') || inner.contains('>') {
-            return Err(CoreError::InvalidAddress(inner.to_owned()));
+            return Err(CoreError::InvalidAddress(s.to_owned()));
         }
-        let at = inner.rfind('@').ok_or_else(|| CoreError::InvalidAddress(inner.to_owned()))?;
+        let at = inner
+            .rfind('@')
+            .ok_or_else(|| CoreError::InvalidAddress(s.to_owned()))?;
         let local  = &inner[..at];
         let domain = &inner[at + 1..];
         if local.is_empty() || domain.is_empty() {
-            return Err(CoreError::InvalidAddress(inner.to_owned()));
+            return Err(CoreError::InvalidAddress(s.to_owned()));
         }
         Ok(Self {
             local:  local.to_lowercase(),
@@ -201,7 +209,7 @@ impl Envelope {
     }
 }
 
-// ─── Message ─────────────────────────────────────────────────────────────────────
+// ─── Message ──────────────────────────────────────────────────────────────────────
 
 /// A complete queued message: envelope metadata + path to raw RFC 5322 body on disk.
 /// The body is *never* loaded into memory by this type.
@@ -212,7 +220,7 @@ pub struct Message {
     pub size: u64,
 }
 
-// ─── Queue state ───────────────────────────────────────────────────────────────────
+// ─── Queue state ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueState {
@@ -237,7 +245,7 @@ impl QueueState {
     }
 }
 
-// ─── Errors ───────────────────────────────────────────────────────────────────────
+// ─── Errors ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -247,7 +255,7 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────────────
+// ─── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -278,28 +286,41 @@ mod tests {
     }
 
     #[test]
-    fn address_rejects_nested_brackets() {
-        assert!(Address::parse("<<a@b>>").is_err());
-        assert!(Address::parse("<a@b>>").is_err());
-        assert!(Address::parse("<<a@b>").is_err());
+    fn address_parse_unbalanced_open() {
+        assert!(Address::parse("<a@b").is_err());
     }
 
     #[test]
-    fn address_rejects_unbalanced_brackets() {
-        assert!(Address::parse("<a@b").is_err());
+    fn address_parse_unbalanced_close() {
         assert!(Address::parse("a@b>").is_err());
     }
 
     #[test]
-    fn address_rejects_empty_parts() {
-        assert!(Address::parse("@b.com").is_err());
-        assert!(Address::parse("a@").is_err());
-        assert!(Address::parse("@").is_err());
+    fn address_parse_nested_brackets_rejected() {
+        assert!(Address::parse("<<a@b>>").is_err());
+    }
+
+    #[test]
+    fn address_parse_empty_local() {
+        assert!(Address::parse("@example.com").is_err());
+    }
+
+    #[test]
+    fn address_parse_empty_domain() {
+        assert!(Address::parse("alice@").is_err());
+    }
+
+    #[test]
+    fn address_parse_lowercase_normalisation() {
+        let a = Address::parse("Alice@Example.COM").unwrap();
+        assert_eq!(a.local, "alice");
+        assert_eq!(a.domain, "example.com");
     }
 
     #[test]
     fn queue_id_format() {
         let id = QueueId::generate();
+        // YYYYMMDDHHmmss.XXXXXX — 21 chars
         assert!(id.0.len() >= 21);
         assert!(id.0.contains('.'));
     }

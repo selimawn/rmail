@@ -20,10 +20,10 @@ use thiserror::Error;
 // ─── Cloudflare DNS addresses ────────────────────────────────────────────────
 // Hardcoded. If you need to change these, change them here — not in config.
 const CLOUDFLARE: &[&str] = &[
-    "1.1.1.1:53",                      // IPv4 primary
-    "1.0.0.1:53",                      // IPv4 secondary
-    "[2606:4700:4700::1111]:53",       // IPv6 primary
-    "[2606:4700:4700::1001]:53",       // IPv6 secondary
+    "1.1.1.1:53",                // IPv4 primary
+    "1.0.0.1:53",                // IPv4 secondary
+    "[2606:4700:4700::1111]:53", // IPv6 primary
+    "[2606:4700:4700::1001]:53", // IPv6 secondary
 ];
 
 // ─── Error type ──────────────────────────────────────────────────────────────
@@ -55,6 +55,7 @@ impl Resolver {
                 socket_addr: addr,
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
+                tls_config: None,
                 trust_negative_responses: true,
                 bind_addr: None,
             });
@@ -64,15 +65,16 @@ impl Resolver {
                 socket_addr: addr,
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
+                tls_config: None,
                 trust_negative_responses: true,
                 bind_addr: None,
             });
         }
 
         let mut opts = ResolverOpts::default();
-        opts.cache_size    = 2048;
+        opts.cache_size = 2048;
         opts.use_hosts_file = false; // /etc/hosts is irrelevant for mail routing
-        opts.validate      = dnssec;
+        opts.validate = dnssec;
 
         tracing::info!(
             nameservers = ?CLOUDFLARE,
@@ -86,7 +88,6 @@ impl Resolver {
     // ─── MX ──────────────────────────────────────────────────────────────────
 
     /// MX records for a domain, sorted by priority (ascending).
-    /// Used by the delivery worker to find the target server.
     pub async fn mx(&self, domain: &str) -> Result<Vec<MxRecord>, DnsError> {
         tracing::debug!(%domain, "MX lookup");
         let resp = self.0.mx_lookup(domain).await?;
@@ -106,8 +107,6 @@ impl Resolver {
 
     // ─── A / AAAA ────────────────────────────────────────────────────────────
 
-    /// All A + AAAA records for a hostname.
-    /// Used after MX lookup to resolve the exchange hostname to IPs.
     pub async fn host(&self, hostname: &str) -> Result<Vec<IpAddr>, DnsError> {
         tracing::debug!(%hostname, "A/AAAA lookup");
         let resp = self.0.lookup_ip(hostname).await?;
@@ -120,8 +119,6 @@ impl Resolver {
 
     // ─── PTR ─────────────────────────────────────────────────────────────────
 
-    /// Reverse DNS (PTR) for an IP.
-    /// Used for FCrDNS check on inbound SMTP connections.
     pub async fn ptr(&self, ip: IpAddr) -> Result<Vec<String>, DnsError> {
         tracing::debug!(%ip, "PTR lookup");
         let resp = self.0.reverse_lookup(ip).await?;
@@ -130,8 +127,6 @@ impl Resolver {
 
     // ─── TXT ─────────────────────────────────────────────────────────────────
 
-    /// Raw TXT records for a name.
-    /// Underlying primitive for SPF, DKIM, DMARC, MTA-STS.
     pub async fn txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
         tracing::debug!(%name, "TXT lookup");
         let resp = self.0.txt_lookup(name).await?;
@@ -147,8 +142,6 @@ impl Resolver {
 
     // ─── SPF ─────────────────────────────────────────────────────────────────
 
-    /// The SPF TXT record for a domain (the one starting with `v=spf1`).
-    /// Returns None if no SPF record is published.
     pub async fn spf(&self, domain: &str) -> Result<Option<String>, DnsError> {
         let txts = self.txt(domain).await?;
         Ok(txts.into_iter().find(|t| t.starts_with("v=spf1")))
@@ -156,8 +149,6 @@ impl Resolver {
 
     // ─── DKIM ────────────────────────────────────────────────────────────────
 
-    /// DKIM public key record: `<selector>._domainkey.<domain>`.
-    /// The key value is used by mail-auth to verify inbound signatures.
     pub async fn dkim_key(&self, selector: &str, domain: &str) -> Result<String, DnsError> {
         let name = format!("{}._domainkey.{}", selector, domain);
         let txts = self.txt(&name).await?;
@@ -168,11 +159,8 @@ impl Resolver {
 
     // ─── DMARC ───────────────────────────────────────────────────────────────
 
-    /// DMARC policy record for a domain (`_dmarc.<domain>`).
-    /// Returns None if no DMARC policy is published (treat as p=none).
     pub async fn dmarc(&self, domain: &str) -> Result<Option<String>, DnsError> {
         let name = format!("_dmarc.{}", domain);
-        // DMARC absence is not an error — many domains don't publish it.
         match self.txt(&name).await {
             Ok(txts) => Ok(txts.into_iter().find(|t| t.starts_with("v=DMARC1"))),
             Err(DnsError::Resolve(_)) => Ok(None),
@@ -185,8 +173,6 @@ impl Resolver {
 
 #[derive(Debug, Clone)]
 pub struct MxRecord {
-    /// Lower = higher priority (RFC 5321).
     pub priority: u16,
-    /// FQDN of the target mail server.
     pub exchange: String,
 }

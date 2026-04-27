@@ -1,0 +1,12 @@
+[package]
+name    = "rmail-tls"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio        = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls       = { workspace = true }
+rustls-pemfile = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }

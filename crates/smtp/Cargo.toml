@@ -1,0 +1,12 @@
+[package]
+name    = "rmail-smtp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rmail-core   = { path = "../core" }
+rmail-config = { path = "../config" }
+nom          = { workspace = true }
+bytes        = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }

@@ -5,13 +5,16 @@
 //! socket. When `step()` returns `Action::Close`, flush and drop.
 
 use std::net::IpAddr;
-use tracing::{debug, info};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use tracing::{debug, info, warn};
 use rmail_core::{Address, Envelope};
 use rmail_config::Config;
 use crate::command::{self, Command};
 use crate::reply::Reply;
 
 /// Maximum line length we accept before hard-closing (prevents memory abuse).
+/// Per RFC 5321 §4.5.3.1.6 this applies to both command lines and DATA lines.
 const MAX_LINE: usize = 1000;
 /// Maximum number of RCPT TO per message (anti-abuse).
 const MAX_RCPTS: usize = 100;
@@ -87,7 +90,10 @@ impl Session {
 
     /// Feed a line from the client. Returns what to do next.
     pub fn step(&mut self, line: &[u8], config: &Config) -> Action {
-        if line.len() > MAX_LINE && self.state != State::Data {
+        // RFC 5321 §4.5.3.1.6: line length limit applies in DATA mode too,
+        // not just to command lines.
+        if line.len() > MAX_LINE {
+            warn!(peer = %self.peer_ip, len = line.len(), "line exceeded MAX_LINE; closing");
             return Action::Close(Reply::syntax_error().to_wire());
         }
 
@@ -249,19 +255,36 @@ impl Session {
     // ─── AUTH ─────────────────────────────────────────────────────────────────
 
     fn do_auth_plain(&mut self, initial: Option<String>, config: &Config) -> Action {
+        if !self.tls_active {
+            warn!(peer = %self.peer_ip, "AUTH PLAIN refused: TLS not active");
+            return Action::Reply(
+                Reply::new(538, "5.7.11 Encryption required for authentication").to_wire(),
+            );
+        }
         let blob = match initial {
             Some(b) => b,
             None    => return Action::Reply(Reply::auth_continue("").to_wire()),
         };
-        if let Some(user) = verify_plain(&blob, config) {
-            self.auth_user = Some(user);
-            Action::Reply(Reply::auth_ok().to_wire())
-        } else {
-            Action::Reply(Reply::auth_fail().to_wire())
+        match verify_plain(&blob, config) {
+            Some(user) => {
+                info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
+                self.auth_user = Some(user);
+                Action::Reply(Reply::auth_ok().to_wire())
+            }
+            None => {
+                warn!(peer = %self.peer_ip, "AUTH PLAIN failed");
+                Action::Reply(Reply::auth_fail().to_wire())
+            }
         }
     }
 
     fn do_auth_login(&mut self) -> Action {
+        if !self.tls_active {
+            warn!(peer = %self.peer_ip, "AUTH LOGIN refused: TLS not active");
+            return Action::Reply(
+                Reply::new(538, "5.7.11 Encryption required for authentication").to_wire(),
+            );
+        }
         self.state = State::AuthLoginPass { username: String::new() };
         Action::Reply(Reply::auth_continue("VXNlcm5hbWU6").to_wire())
     }
@@ -276,11 +299,13 @@ impl Session {
         let pass = decode_b64(line_str);
         if let Some(u) = config.find_user(&user) {
             if rmail_auth::password::verify(&pass, &u.password_hash) {
+                info!(peer = %self.peer_ip, %user, "AUTH LOGIN success");
                 self.auth_user = Some(user);
                 self.state = State::Greeted;
                 return Action::Reply(Reply::auth_ok().to_wire());
             }
         }
+        warn!(peer = %self.peer_ip, attempted_user = %user, "AUTH LOGIN failed");
         self.state = State::Greeted;
         Action::Reply(Reply::auth_fail().to_wire())
     }
@@ -305,36 +330,18 @@ impl Session {
 
 // ─── auth helpers ────────────────────────────────────────────────────────────
 
+/// Decode a base64 SASL token. Returns an empty string on invalid input —
+/// callers must treat empty as auth failure.
 fn decode_b64(s: &str) -> String {
-    let bytes = base64_decode(s.trim());
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn base64_decode(s: &str) -> Vec<u8> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut map = [255u8; 256];
-    for (i, &c) in ALPHABET.iter().enumerate() { map[c as usize] = i as u8; }
-    let s = s.trim_end_matches('=').as_bytes();
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut buf = 0u32;
-    let mut bits = 0usize;
-    for &c in s {
-        let v = map[c as usize];
-        if v == 255 { continue; }
-        buf = (buf << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
+    match B64.decode(s.trim()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
     }
-    out
 }
 
 /// Verify AUTH PLAIN blob: `\0user\0password` (base64-encoded).
 fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
-    let raw = base64_decode(blob);
+    let raw = B64.decode(blob.trim()).ok()?;
     let parts: Vec<&[u8]> = raw.splitn(3, |&b| b == 0).collect();
     if parts.len() < 3 { return None; }
     let user = std::str::from_utf8(parts[1]).ok()?;

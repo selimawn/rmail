@@ -47,6 +47,10 @@ impl fmt::Display for QueueId {
 // ─── Address ─────────────────────────────────────────────────────────────────
 
 /// A parsed RFC 5321 email address.
+///
+/// Local-part is normalized to lowercase. Per RFC 5321 §2.4 the local-part
+/// is technically case-sensitive, but in practice every modern MTA normalizes
+/// to avoid duplicate accounts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Address {
     pub local: String,
@@ -56,15 +60,48 @@ pub struct Address {
 impl Address {
     /// Parse from `<user@domain>` or `user@domain`.
     /// An empty/null address `<>` returns `Address::null()`.
+    ///
+    /// Strict: rejects multiple angle brackets, lone brackets, whitespace,
+    /// control characters, leading/trailing/consecutive dots, oversized parts,
+    /// and any character outside the RFC 5321 atext + dot set for local-part
+    /// or LDH for domain.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
-        let s = s.trim().trim_start_matches('<').trim_end_matches('>').trim();
+        let s = s.trim();
+        let has_open = s.starts_with('<');
+        let has_close = s.ends_with('>');
+        let s = match (has_open, has_close) {
+            (true, true) => &s[1..s.len() - 1],
+            (false, false) => s,
+            _ => return Err(CoreError::InvalidAddress(s.to_owned())),
+        };
+        let s = s.trim();
         if s.is_empty() {
             return Ok(Self::null());
         }
         let at = s.rfind('@').ok_or_else(|| CoreError::InvalidAddress(s.to_owned()))?;
+        let local = &s[..at];
+        let domain = &s[at + 1..];
+        if local.is_empty() || domain.is_empty() {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
+        if local.len() > 64 || domain.len() > 253 {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
+        if !local.chars().all(is_atext_or_dot) {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
+        if !domain.chars().all(is_domain_char) {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
+        if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
+        if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
         Ok(Self {
-            local:  s[..at].to_lowercase(),
-            domain: s[at + 1..].to_lowercase(),
+            local:  local.to_lowercase(),
+            domain: domain.to_lowercase(),
         })
     }
 
@@ -94,6 +131,21 @@ impl fmt::Display for Address {
             write!(f, "<{}@{}>", self.local, self.domain)
         }
     }
+}
+
+/// RFC 5322 atext + `.` (used between atoms).
+fn is_atext_or_dot(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '/'
+                | '=' | '?' | '^' | '_' | '`' | '{' | '|' | '}' | '~' | '.'
+        )
+}
+
+/// LDH (letters, digits, hyphen) plus the dot separator.
+fn is_domain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
 }
 
 // ─── Recipient ───────────────────────────────────────────────────────────────
@@ -257,6 +309,43 @@ mod tests {
     #[test]
     fn address_parse_invalid() {
         assert!(Address::parse("notanemail").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_multi_brackets() {
+        assert!(Address::parse("<<a@b>>").is_err());
+        assert!(Address::parse("<<<a@b>>>").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_lone_bracket() {
+        assert!(Address::parse("<a@b").is_err());
+        assert!(Address::parse("a@b>").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_whitespace() {
+        assert!(Address::parse("a b@example.com").is_err());
+        assert!(Address::parse("a@exa mple.com").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_consecutive_dots() {
+        assert!(Address::parse("a..b@example.com").is_err());
+        assert!(Address::parse("a@example..com").is_err());
+    }
+
+    #[test]
+    fn address_parse_lowercases() {
+        let a = Address::parse("Alice@Example.COM").unwrap();
+        assert_eq!(a.local, "alice");
+        assert_eq!(a.domain, "example.com");
+    }
+
+    #[test]
+    fn address_parse_plus_addressing() {
+        let a = Address::parse("user+tag@example.com").unwrap();
+        assert_eq!(a.local, "user+tag");
     }
 
     #[test]

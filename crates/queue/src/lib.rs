@@ -16,9 +16,11 @@
 //! - `<id>.eml` — raw RFC 5322 bytes (dot-stuffing decoded)
 //!
 //! State transitions are atomic `rename(2)` calls.
-//! If rmail crashes mid-delivery, the message stays in its last stable dir.
+//! Directory entries are fsynced after each rename so the move survives a
+//! kernel crash. If rmail crashes mid-delivery, the message stays in its
+//! last stable dir.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -68,7 +70,9 @@ impl Queue {
     // ─── Enqueue ─────────────────────────────────────────────────────────────
 
     /// Accept a message into `incoming/`.
-    /// Writes body first, then envelope. Both are fsynced before returning.
+    /// Writes body first, then envelope. Both files are fsynced before returning,
+    /// and the `incoming/` directory itself is fsynced so the new entries
+    /// survive a kernel crash.
     /// Returns the message ID (= `envelope.id`).
     pub async fn enqueue(
         &self,
@@ -93,14 +97,19 @@ impl Queue {
         f.sync_data().await?;
         drop(f);
 
+        // 3. Fsync the directory so the new entries are durable
+        sync_dir(&self.dir(QueueState::Incoming)).await?;
+
         Ok(id)
     }
 
     // ─── State transitions ───────────────────────────────────────────────────
 
     /// Atomically move a message from one state directory to another.
-    /// Envelope is renamed first; if only that succeeds on a crash,
-    /// a scan of `from/` will not find a dangling `.eml`.
+    /// Body is renamed first; if a crash happens between the two renames,
+    /// a sweep of `from/` will find a dangling `.env` (the env scan keys on
+    /// `.env` files, so the message stays visible in `from`).
+    /// Both source and destination directories are fsynced.
     pub async fn transition(
         &self,
         id: &str,
@@ -108,8 +117,14 @@ impl Queue {
         to: QueueState,
     ) -> Result<(), QueueError> {
         debug!(%id, from = from.dir_name(), to = to.dir_name(), "queue transition");
-        fs::rename(self.env_path(from, id), self.env_path(to, id)).await?;
+        // Body first: a crash here leaves the .env in `from`, so the message
+        // is still discoverable via list(from).
         fs::rename(self.eml_path(from, id), self.eml_path(to, id)).await?;
+        fs::rename(self.env_path(from, id), self.env_path(to, id)).await?;
+        // Fsync both directories — POSIX requires this for full durability
+        // when renaming across directories on the same filesystem.
+        sync_dir(&self.dir(from)).await?;
+        sync_dir(&self.dir(to)).await?;
         Ok(())
     }
 
@@ -128,7 +143,7 @@ impl Queue {
     // ─── Update envelope ─────────────────────────────────────────────────────
 
     /// Rewrite the envelope in-place after updating delivery status.
-    /// Uses a tmp file + rename for atomicity.
+    /// Uses a tmp file + rename for atomicity, then fsyncs the directory.
     pub async fn update_envelope(
         &self,
         state: QueueState,
@@ -143,6 +158,7 @@ impl Queue {
         f.sync_data().await?;
         drop(f);
         fs::rename(&tmp, &path).await?;
+        sync_dir(&self.dir(state)).await?;
         Ok(())
     }
 
@@ -176,6 +192,23 @@ impl Queue {
         if let Err(e) = fs::remove_file(self.eml_path(state, id)).await {
             warn!(%id, "could not remove .eml: {}", e);
         }
+        // Best-effort dir fsync; not critical for removal durability
+        let _ = sync_dir(&self.dir(state)).await;
         Ok(())
     }
+}
+
+/// Open a directory and fsync it so prior renames/creates within it are durable.
+/// No-op on non-Unix targets (Windows has no equivalent fsync-on-directory).
+async fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let f = fs::File::open(path).await?;
+        f.sync_all().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }

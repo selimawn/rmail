@@ -13,8 +13,10 @@
 //! ```
 //!
 //! One file = one message. Lock-free thanks to atomic `rename(2)` from `tmp/` to `new/`.
+//! Directories are fsynced after each rename so deliveries survive a kernel crash.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::{debug, info};
@@ -82,6 +84,7 @@ impl Maildir {
     /// Steps:
     /// 1. Write to `tmp/<unique>` and fsync.
     /// 2. `rename(tmp/<unique>, new/<unique>)` — atomic.
+    /// 3. fsync the `new/` directory so the rename is durable.
     ///
     /// Returns the Maildir filename.
     pub async fn deliver(
@@ -98,12 +101,16 @@ impl Maildir {
         let tmp_path = base.join("tmp").join(&filename);
         let new_path = base.join("new").join(&filename);
 
+        // Write + fsync the body file
         tokio::fs::write(&tmp_path, body).await?;
         {
             let f = tokio::fs::File::open(&tmp_path).await?;
             f.sync_data().await?;
         }
+        // Atomic move into new/
         tokio::fs::rename(&tmp_path, &new_path).await?;
+        // Fsync new/ so the rename survives a kernel crash
+        sync_dir(&base.join("new")).await?;
 
         debug!(address = %address, file = %filename, bytes = body.len(), "delivered");
         Ok(filename)
@@ -187,6 +194,7 @@ impl Maildir {
         let cur_dir = path.parent().unwrap().parent().unwrap().join("cur");
         let new_path = cur_dir.join(&new_name);
         tokio::fs::rename(path, &new_path).await?;
+        sync_dir(&cur_dir).await?;
         Ok(new_path)
     }
 
@@ -196,8 +204,10 @@ impl Maildir {
     pub async fn mark_deleted(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
         let filename = path.file_name().unwrap().to_string_lossy();
         let new_name = add_flag(&filename, 'T');
-        let new_path = path.parent().unwrap().join(&new_name);
+        let parent = path.parent().unwrap();
+        let new_path = parent.join(&new_name);
         tokio::fs::rename(path, &new_path).await?;
+        sync_dir(parent).await?;
         Ok(new_path)
     }
 
@@ -222,18 +232,35 @@ pub struct MaildirEntry {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Generate a unique Maildir filename.
-/// Format: `<timestamp>.<pid>_<counter>.rmail`
+/// Cached host identifier for Maildir filenames. Read from /proc/sys/kernel/hostname
+/// (Linux) or /etc/hostname, with a sane fallback. `:` and `/` (forbidden by
+/// Maildir spec) are replaced with `_`.
+fn host_id() -> &'static str {
+    static H: OnceLock<String> = OnceLock::new();
+    H.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "rmail".into())
+            .replace('/', "_")
+            .replace(':', "_")
+    })
+}
+
+/// Generate a unique Maildir filename per the DJB convention:
+///   `<timestamp>.M<usec>P<pid>Q<counter>.<host>`
+/// `M` = microseconds, `P` = pid, `Q` = local sequence counter.
 fn unique_filename() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ts = now.as_secs();
+    let usec = now.subsec_micros();
     let pid = std::process::id();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}.{}_{}.rmail", ts, pid, n)
+    format!("{}.M{}P{}Q{}.{}", ts, usec, pid, n, host_id())
 }
 
 /// Extract Maildir flags from filename.
@@ -259,4 +286,19 @@ fn add_flag(filename: &str, flag: char) -> String {
     } else {
         format!("{}:2,{}", filename, flag)
     }
+}
+
+/// Open a directory and fsync it so prior renames/creates within it are durable.
+/// No-op on non-Unix targets (Windows has no equivalent fsync-on-directory).
+async fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let f = fs::File::open(path).await?;
+        f.sync_all().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }

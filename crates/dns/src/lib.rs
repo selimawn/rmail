@@ -15,6 +15,7 @@ use hickory_resolver::{
     TokioAsyncResolver,
 };
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use thiserror::Error;
 
 // ─── Cloudflare DNS addresses ────────────────────────────────────────────────
@@ -25,6 +26,9 @@ const CLOUDFLARE: &[&str] = &[
     "[2606:4700:4700::1111]:53", // IPv6 primary
     "[2606:4700:4700::1001]:53", // IPv6 secondary
 ];
+
+const RESOLVER_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVER_ATTEMPTS: usize = 2;
 
 // ─── Error type ──────────────────────────────────────────────────────────────
 
@@ -75,10 +79,14 @@ impl Resolver {
         opts.cache_size = 2048;
         opts.use_hosts_file = false; // /etc/hosts is irrelevant for mail routing
         opts.validate = dnssec;
+        opts.timeout = RESOLVER_TIMEOUT;
+        opts.attempts = RESOLVER_ATTEMPTS;
 
         tracing::info!(
             nameservers = ?CLOUDFLARE,
             dnssec,
+            timeout_secs = RESOLVER_TIMEOUT.as_secs(),
+            attempts = RESOLVER_ATTEMPTS,
             "DNS resolver initialised (Cloudflare)"
         );
 

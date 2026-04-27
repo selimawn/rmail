@@ -1,7 +1,5 @@
-//! Authentication and mail authentication.
-//!
-//! - `verify_password` — SASL credential check (argon2id)
-//! - `AuthChecker`     — SPF / DKIM / DMARC verification on inbound messages
-
+pub mod dkim;
+pub mod spf;
+pub mod dmarc;
 pub mod password;
-pub mod checker;
+pub mod fcrdns;

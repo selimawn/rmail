@@ -1,342 +1,384 @@
-//! SMTP session state machine.
+//! Inbound SMTP session state machine.
 //!
-//! One `SmtpSession` per accepted TCP connection.
-//! Drive it by calling `step(command)` after reading each line.
-//! Collect body bytes by calling `feed_data(chunk)` during the DATA phase.
+//! One `Session` per accepted TCP connection. The caller is responsible for
+//! driving it: read a line, call `step()`, write the returned bytes to the
+//! socket. When `step()` returns `Action::Close`, flush and drop.
 
 use std::net::IpAddr;
-use crate::command::SmtpCommand;
-use crate::reply::Reply;
+use tracing::{debug, info, warn};
 use rmail_core::{Address, Envelope};
+use rmail_config::Config;
+use crate::command::{self, Command};
+use crate::reply::Reply;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionState {
-    /// Connection accepted, greeting sent, waiting for EHLO/HELO.
+/// Maximum line length we accept before hard-closing (prevents memory abuse).
+const MAX_LINE: usize = 1000;
+/// Maximum number of RCPT TO per message (anti-abuse).
+const MAX_RCPTS: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// Accepted TCP connection, banner sent, waiting for EHLO/HELO.
     Connected,
-    /// EHLO received. Waiting for MAIL FROM (or AUTH on Submission).
+    /// EHLO received.
     Greeted,
-    /// STARTTLS handshake requested — caller must upgrade the stream.
-    UpgradeTls,
-    /// AUTH in progress — waiting for credential line.
-    AuthWait { mechanism: AuthMechanism },
-    /// MAIL FROM accepted.
-    Mailing { from: Address },
-    /// At least one RCPT TO accepted.
-    Collecting { from: Address, rcpts: Vec<Address> },
-    /// DATA accepted — body streaming in progress.
-    Data { from: Address, rcpts: Vec<Address> },
-    /// Message accepted, back to Greeted.
-    Accepted,
-    /// QUIT — connection should be closed.
-    Closing,
+    /// STARTTLS negotiated.
+    Tls,
+    /// MAIL FROM received.
+    Mailing,
+    /// At least one RCPT TO received.
+    Rcpt,
+    /// DATA accepted, reading message body.
+    Data,
+    /// AUTH in progress (LOGIN mechanism, waiting for password).
+    AuthLoginPass { username: String },
+    /// Session closed.
+    Closed,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum AuthMechanism { Plain, Login }
-
-/// Result of a single `step()` call.
-#[derive(Debug)]
-pub enum StepResult {
-    Reply(Reply),
-    /// Caller must perform STARTTLS upgrade then call `reset()` on the session.
-    UpgradeTls(Reply),
-    /// Message is complete. Caller should enqueue and reply with 250.
-    MessageComplete {
+/// What the caller must do after `step()`.
+pub enum Action {
+    /// Write these bytes to the socket and continue.
+    Reply(Vec<u8>),
+    /// Write bytes, then upgrade the stream to TLS.
+    UpgradeTls(Vec<u8>),
+    /// Write bytes, then close the connection.
+    Close(Vec<u8>),
+    /// Message body complete: deliver this envelope + body to the queue.
+    /// Write the included bytes to the socket afterwards.
+    Enqueue {
         envelope: Envelope,
         body: Vec<u8>,
+        reply: Vec<u8>,
     },
-    Close(Reply),
 }
 
-pub struct SmtpSession {
-    pub state:       SessionState,
-    pub hostname:    String,
-    pub max_bytes:   u64,
-    pub client_ip:   IpAddr,
-    pub tls_active:  bool,
-    pub auth_user:   Option<String>,
-    body_buf:        Vec<u8>,
-    body_bytes:      u64,
-    /// For AUTH LOGIN, we hold the username between challenges.
-    auth_user_tmp:   Option<String>,
+pub struct Session {
+    state: State,
+    peer_ip: IpAddr,
+    helo: String,
+    tls_active: bool,
+    auth_user: Option<String>,
+    // Accumulator for MAIL FROM / RCPT TO across a single transaction.
+    from: Option<Address>,
+    rcpts: Vec<Address>,
+    // DATA accumulator (streamed; we flush to disk via the Enqueue action).
+    body_buf: Vec<u8>,
+    // Track whether SIZE was announced and what limit applies.
+    max_size: u64,
 }
 
-impl SmtpSession {
-    pub fn new(hostname: impl Into<String>, max_bytes: u64, client_ip: IpAddr) -> Self {
-        Self {
-            state:        SessionState::Connected,
-            hostname:     hostname.into(),
-            max_bytes,
-            client_ip,
-            tls_active:   false,
-            auth_user:    None,
-            body_buf:     Vec::new(),
-            body_bytes:   0,
-            auth_user_tmp: None,
+impl Session {
+    pub fn new(peer_ip: IpAddr, config: &Config) -> (Self, Vec<u8>) {
+        let banner = Reply::ready(&config.server.hostname).to_wire();
+        (
+            Self {
+                state: State::Connected,
+                peer_ip,
+                helo: String::new(),
+                tls_active: false,
+                auth_user: None,
+                from: None,
+                rcpts: Vec::new(),
+                body_buf: Vec::new(),
+                max_size: config.max_message_bytes(),
+            },
+            banner,
+        )
+    }
+
+    /// Feed a line from the client. Returns what to do next.
+    /// In `Data` state, `line` is a raw body line (not a command).
+    pub fn step(&mut self, line: &[u8], config: &Config) -> Action {
+        if line.len() > MAX_LINE && self.state != State::Data {
+            return Action::Close(Reply::syntax_error().to_wire());
+        }
+
+        match self.state {
+            State::Data => self.handle_data_line(line, config),
+            State::AuthLoginPass { ref username } => {
+                // Expect base64-encoded password
+                let user = username.clone();
+                self.handle_auth_login_pass(line, &user, config)
+            }
+            _ => {
+                let line_str = match std::str::from_utf8(line) {
+                    Ok(s) => s,
+                    Err(_) => return Action::Reply(Reply::syntax_error().to_wire()),
+                };
+                match command::parse(line_str) {
+                    Ok(cmd) => self.handle_command(cmd, config),
+                    Err(_)  => Action::Reply(Reply::syntax_error().to_wire()),
+                }
+            }
         }
     }
 
-    /// Process one command line. Returns the reply (or action) for the caller.
-    pub fn step(
-        &mut self,
-        cmd: SmtpCommand,
-        // Closure called for RCPT TO to check if user exists in the local domain.
-        // Returns Ok(is_local) or Err(user_unknown).
-        check_rcpt: &dyn Fn(&Address) -> RcptCheck,
-        // Closure called to verify AUTH credentials. Returns the username on success.
-        verify_auth: &dyn Fn(&str, &str) -> Option<String>,
-    ) -> StepResult {
-        use SmtpCommand::*;
-        use SessionState::*;
+    // ─── command dispatch ─────────────────────────────────────────────────────
 
-        match (&self.state.clone(), cmd) {
-            // NOOP is valid in any state
-            (_, Noop) => StepResult::Reply(Reply::ok("2.0.0 OK")),
-
-            // QUIT is valid in any state
-            (_, Quit) => {
-                self.state = Closing;
-                StepResult::Close(Reply::bye())
-            }
-
-            // RSET returns to Greeted
-            (_, Rset) => {
-                self.reset_transaction();
-                StepResult::Reply(Reply::ok("2.0.0 Reset"))
-            }
-
-            // EHLO / HELO
-            (Connected | Greeted | Accepted, Ehlo(domain)) => {
-                self.state = Greeted;
-                StepResult::Reply(Reply::ehlo_response(
-                    &self.hostname,
-                    self.max_bytes,
-                    !self.tls_active,
-                ))
-            }
-            (Connected | Greeted | Accepted, Helo(domain)) => {
-                self.state = Greeted;
-                StepResult::Reply(Reply::ok(format!("Hello {}", domain)))
-            }
-
-            // STARTTLS
-            (Greeted, StartTls) if !self.tls_active => {
-                self.state = UpgradeTls;
-                StepResult::UpgradeTls(Reply::ready_tls())
-            }
-            (_, StartTls) => StepResult::Reply(Reply::bad_sequence()),
-
-            // AUTH PLAIN inline credentials
-            (Greeted, AuthPlain(Some(creds))) => {
-                self.handle_auth_plain(&creds, verify_auth)
-            }
-            // AUTH PLAIN — server sends 334 to prompt for credentials
-            (Greeted, AuthPlain(None)) => {
-                self.state = AuthWait { mechanism: AuthMechanism::Plain };
-                StepResult::Reply(Reply::auth_continue(""))
-            }
-            (Greeted, AuthLogin) => {
-                self.state = AuthWait { mechanism: AuthMechanism::Login };
-                StepResult::Reply(Reply::auth_continue("Username:"))
-            }
-
-            // MAIL FROM
-            (Greeted, MailFrom { address, size }) => {
-                if let Some(sz) = size {
-                    if sz > self.max_bytes {
-                        return StepResult::Reply(Reply::too_big(self.max_bytes));
-                    }
-                }
-                match Address::parse(&address) {
-                    Ok(addr) => {
-                        self.state = Mailing { from: addr };
-                        StepResult::Reply(Reply::ok("2.1.0 OK"))
-                    }
-                    Err(_) => StepResult::Reply(Reply::syntax_error()),
-                }
-            }
-
-            // RCPT TO
-            (Mailing { from } | Collecting { from, .. }, RcptTo(addr_str)) => {
-                let from = from.clone();
-                match Address::parse(&addr_str) {
-                    Err(_) => StepResult::Reply(Reply::syntax_error()),
-                    Ok(addr) => match check_rcpt(&addr) {
-                        RcptCheck::LocalOk => {
-                            let rcpts = match &self.state {
-                                Collecting { rcpts, .. } => {
-                                    let mut r = rcpts.clone();
-                                    r.push(addr);
-                                    r
-                                }
-                                _ => vec![addr],
-                            };
-                            self.state = Collecting { from, rcpts };
-                            StepResult::Reply(Reply::ok("2.1.5 OK"))
-                        }
-                        RcptCheck::RelayDenied  => StepResult::Reply(Reply::relay_denied()),
-                        RcptCheck::UserUnknown  => StepResult::Reply(Reply::user_unknown()),
-                    },
-                }
-            }
-
-            // DATA
-            (Collecting { from, rcpts }, Data) => {
-                let from = from.clone();
-                let rcpts = rcpts.clone();
-                self.body_buf.clear();
-                self.body_bytes = 0;
-                self.state = SessionState::Data { from, rcpts };
-                StepResult::Reply(Reply::start_data())
-            }
-
-            _ => StepResult::Reply(Reply::bad_sequence()),
+    fn handle_command(&mut self, cmd: Command, config: &Config) -> Action {
+        debug!(peer = %self.peer_ip, state = ?self.state, ?cmd, "SMTP command");
+        match cmd {
+            Command::Ehlo(domain) | Command::Helo(domain) => self.do_ehlo(domain, config),
+            Command::StartTls  => self.do_starttls(),
+            Command::MailFrom { address, size } => self.do_mail_from(address, size, config),
+            Command::RcptTo(addr) => self.do_rcpt_to(addr, config),
+            Command::Data        => self.do_data(),
+            Command::Rset        => self.do_rset(),
+            Command::Quit        => Action::Close(Reply::bye().to_wire()),
+            Command::Noop        => Action::Reply(Reply::ok().to_wire()),
+            Command::AuthPlain(initial) => self.do_auth_plain(initial, config),
+            Command::AuthLogin   => self.do_auth_login(),
+            Command::Vrfy(_)     => Action::Reply(Reply::new(252, "2.1.5 Cannot VRFY user").to_wire()),
         }
     }
 
-    /// Feed a raw DATA line (including CRLF). Call repeatedly.
-    /// Returns `Some(StepResult::MessageComplete { .. })` when `.` is received.
-    pub fn feed_data(
-        &mut self,
-        line: &[u8],
-        check_rcpt: &dyn Fn(&Address) -> RcptCheck,
-        verify_auth: &dyn Fn(&str, &str) -> Option<String>,
-    ) -> Option<StepResult> {
-        if let SessionState::Data { from, rcpts } = &self.state {
-            // End-of-data marker: a line with only "."
-            let stripped = line.strip_suffix(b"\r\n").unwrap_or(line);
-            if stripped == b"." {
-                let from = from.clone();
-                let rcpts = rcpts.clone();
-                let body = std::mem::take(&mut self.body_buf);
-                self.state = SessionState::Accepted;
-                let envelope = Envelope::new(
-                    from,
-                    rcpts,
-                    self.client_ip,
-                    "",
-                    self.auth_user.clone(),
-                );
-                return Some(StepResult::MessageComplete { envelope, body });
-            }
+    fn do_ehlo(&mut self, domain: String, config: &Config) -> Action {
+        self.helo = domain;
+        self.reset_transaction();
+        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        Action::Reply(
+            Reply::ehlo_caps(
+                &config.server.hostname,
+                config.max_message_bytes(),
+                !self.tls_active, // advertise STARTTLS only before upgrade
+            )
+            .to_wire(),
+        )
+    }
 
-            // Dot-unstuffing: a leading "." that is NOT the end marker
-            let body_line = if stripped.starts_with(b".") {
-                &stripped[1..]
-            } else {
-                stripped
-            };
-
-            self.body_bytes += body_line.len() as u64;
-            if self.body_bytes > self.max_bytes {
-                return Some(StepResult::Reply(Reply::too_big(self.max_bytes)));
-            }
-            self.body_buf.extend_from_slice(body_line);
-            self.body_buf.extend_from_slice(b"\r\n");
+    fn do_starttls(&mut self) -> Action {
+        if self.tls_active {
+            return Action::Reply(Reply::bad_sequence().to_wire());
         }
+        Action::UpgradeTls(Reply::start_tls().to_wire())
+    }
+
+    fn do_mail_from(&mut self, address: String, size: Option<u64>, config: &Config) -> Action {
+        if !matches!(self.state, State::Greeted | State::Tls) {
+            return Action::Reply(Reply::bad_sequence().to_wire());
+        }
+        // Size check (if client announced one)
+        if let Some(sz) = size {
+            if sz > self.max_size {
+                return Action::Reply(Reply::message_too_large().to_wire());
+            }
+        }
+        match Address::parse(&address) {
+            Ok(addr) => {
+                self.from = Some(addr);
+                self.state = State::Mailing;
+                Action::Reply(Reply::ok_msg("2.1.0 OK").to_wire())
+            }
+            Err(_) => Action::Reply(Reply::new(501, "5.1.7 Bad sender address syntax").to_wire()),
+        }
+    }
+
+    fn do_rcpt_to(&mut self, address: String, config: &Config) -> Action {
+        if !matches!(self.state, State::Mailing | State::Rcpt) {
+            return Action::Reply(Reply::bad_sequence().to_wire());
+        }
+        if self.rcpts.len() >= MAX_RCPTS {
+            return Action::Reply(Reply::new(452, "4.5.3 Too many recipients").to_wire());
+        }
+        let addr = match Address::parse(&address) {
+            Ok(a) => a,
+            Err(_) => return Action::Reply(Reply::new(501, "5.1.3 Bad recipient address syntax").to_wire()),
+        };
+        // Relay check: only accept mail for local domains on port 25
+        if !config.is_local_domain(&addr.domain) {
+            // Authenticated users may relay
+            if self.auth_user.is_none() {
+                return Action::Reply(Reply::relay_denied().to_wire());
+            }
+        } else {
+            // Local domain: user must exist
+            if config.find_user(&addr.as_str()).is_none() {
+                return Action::Reply(Reply::user_unknown(&addr.as_str()).to_wire());
+            }
+        }
+        self.rcpts.push(addr);
+        self.state = State::Rcpt;
+        Action::Reply(Reply::ok_msg("2.1.5 OK").to_wire())
+    }
+
+    fn do_data(&mut self) -> Action {
+        if self.state != State::Rcpt {
+            return Action::Reply(Reply::bad_sequence().to_wire());
+        }
+        self.state = State::Data;
+        self.body_buf.clear();
+        Action::Reply(Reply::start_data().to_wire())
+    }
+
+    fn do_rset(&mut self) -> Action {
+        self.reset_transaction();
+        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        Action::Reply(Reply::ok().to_wire())
+    }
+
+    // ─── DATA body accumulation ───────────────────────────────────────────────
+
+    fn handle_data_line(&mut self, line: &[u8], config: &Config) -> Action {
+        // End-of-data marker: a line containing only a dot
+        if line == b".\r\n" || line == b".\n" || line == b"." {
+            return self.finalize_data(config);
+        }
+        // Dot-stuffing: leading `..` → `.`
+        let line = if line.starts_with(b"..") { &line[1..] } else { line };
+
+        // Size guard
+        if self.body_buf.len() + line.len() > self.max_size as usize {
+            self.reset_transaction();
+            self.state = State::Greeted;
+            return Action::Reply(Reply::message_too_large().to_wire());
+        }
+        self.body_buf.extend_from_slice(line);
+        Action::Reply(vec![]) // no reply mid-data
+    }
+
+    fn finalize_data(&mut self, config: &Config) -> Action {
+        let from = self.from.take().unwrap_or_else(Address::null);
+        let rcpts = std::mem::take(&mut self.rcpts);
+        let body  = std::mem::take(&mut self.body_buf);
+
+        let envelope = Envelope::new(
+            from,
+            rcpts,
+            self.peer_ip,
+            self.helo.clone(),
+            self.auth_user.clone(),
+        );
+        let id = envelope.id.to_string();
+        info!(id, peer = %self.peer_ip, "message accepted");
+        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        Action::Enqueue {
+            reply: Reply::queued(&id).to_wire(),
+            envelope,
+            body,
+        }
+    }
+
+    // ─── AUTH ─────────────────────────────────────────────────────────────────
+
+    fn do_auth_plain(&mut self, initial: Option<String>, config: &Config) -> Action {
+        let blob = match initial {
+            Some(b) => b,
+            None    => return Action::Reply(Reply::auth_continue("").to_wire()),
+        };
+        if let Some(user) = verify_plain(&blob, config) {
+            self.auth_user = Some(user);
+            Action::Reply(Reply::auth_ok().to_wire())
+        } else {
+            Action::Reply(Reply::auth_fail().to_wire())
+        }
+    }
+
+    fn do_auth_login(&mut self) -> Action {
+        // Ask for username in base64
+        self.state = State::AuthLoginPass { username: String::new() };
+        // First challenge: "Username:"
+        Action::Reply(Reply::auth_continue("VXNlcm5hbWU6").to_wire())
+    }
+
+    fn handle_auth_login_pass(&mut self, line: &[u8], username_b64: &str, config: &Config) -> Action {
+        // First response is the username in base64; state hack: we store it in the enum
+        // username_b64 is empty on first call → this is the username
+        let line_str = std::str::from_utf8(line).unwrap_or("").trim();
+        if username_b64.is_empty() {
+            // Got username, ask for password
+            self.state = State::AuthLoginPass { username: line_str.to_owned() };
+            return Action::Reply(Reply::auth_continue("UGFzc3dvcmQ6").to_wire()); // "Password:"
+        }
+        // Got password — verify
+        // username_b64 holds the base64 username; decode both
+        let user = decode_b64(username_b64);
+        let pass = decode_b64(line_str);
+        if let Some(u) = config.find_user(&user) {
+            if verify_argon2(&pass, &u.password_hash) {
+                self.auth_user = Some(user);
+                self.state = State::Greeted;
+                return Action::Reply(Reply::auth_ok().to_wire());
+            }
+        }
+        self.state = State::Greeted;
+        Action::Reply(Reply::auth_fail().to_wire())
+    }
+
+    // ─── helpers ──────────────────────────────────────────────────────────────
+
+    fn reset_transaction(&mut self) {
+        self.from  = None;
+        self.rcpts.clear();
+        self.body_buf.clear();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state == State::Closed
+    }
+
+    /// Called by TLS layer after upgrade completes.
+    pub fn mark_tls_active(&mut self) {
+        self.tls_active = true;
+        self.state = State::Connected; // client will re-EHLO
+    }
+}
+
+// ─── auth helpers ────────────────────────────────────────────────────────────
+
+fn decode_b64(s: &str) -> String {
+    use std::io::Read;
+    // base64 decode; ignore errors → empty string
+    let bytes = base64_decode(s.trim());
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    // Simple base64 decode without pulling in another dep
+    // We already have `base64 = "0.22"` in workspace
+    use std::collections::HashMap;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut map = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() { map[c as usize] = i as u8; }
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0usize;
+    for &c in s {
+        let v = map[c as usize];
+        if v == 255 { continue; }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+/// Verify AUTH PLAIN blob: `\0user\0password` (base64-encoded).
+fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
+    let raw = base64_decode(blob);
+    // Format: [authzid] NUL authcid NUL passwd
+    let parts: Vec<&[u8]> = raw.splitn(3, |&b| b == 0).collect();
+    if parts.len() < 3 { return None; }
+    let user = std::str::from_utf8(parts[1]).ok()?;
+    let pass = std::str::from_utf8(parts[2]).ok()?;
+    let cfg_user = config.find_user(user)?;
+    if verify_argon2(pass, &cfg_user.password_hash) {
+        Some(user.to_owned())
+    } else {
         None
     }
-
-    /// Feed a continuation line during AUTH (base64 credentials or username).
-    pub fn feed_auth(
-        &mut self,
-        line: &str,
-        verify_auth: &dyn Fn(&str, &str) -> Option<String>,
-    ) -> StepResult {
-        let mechanism = if let SessionState::AuthWait { mechanism } = &self.state {
-            mechanism.clone()
-        } else {
-            return StepResult::Reply(Reply::bad_sequence());
-        };
-
-        match mechanism {
-            AuthMechanism::Plain => self.handle_auth_plain(line.trim(), verify_auth),
-            AuthMechanism::Login => {
-                if self.auth_user_tmp.is_none() {
-                    // First continuation: username (base64)
-                    let username = decode_base64(line.trim()).unwrap_or_default();
-                    self.auth_user_tmp = Some(username);
-                    StepResult::Reply(Reply::auth_continue("Password:"))
-                } else {
-                    // Second continuation: password (base64)
-                    let username = self.auth_user_tmp.take().unwrap_or_default();
-                    let password = decode_base64(line.trim()).unwrap_or_default();
-                    self.finish_auth(&username, &password, verify_auth)
-                }
-            }
-        }
-    }
-
-    pub fn reset_transaction(&mut self) {
-        self.state = SessionState::Greeted;
-        self.body_buf.clear();
-        self.body_bytes = 0;
-        self.auth_user_tmp = None;
-    }
-
-    /// Called by the listener after a successful STARTTLS upgrade.
-    pub fn tls_upgraded(&mut self) {
-        self.tls_active = true;
-        self.state = SessionState::Connected;
-    }
-
-    // ─── Auth internals ────────────────────────────────────────────────
-
-    fn handle_auth_plain(
-        &mut self,
-        creds: &str,
-        verify_auth: &dyn Fn(&str, &str) -> Option<String>,
-    ) -> StepResult {
-        // RFC 4616: base64("\0authzid\0password") — or "\0user\0pass" without authzid
-        let decoded = match decode_base64(creds) {
-            Some(d) => d,
-            None => return StepResult::Reply(Reply::auth_failed()),
-        };
-        let parts: Vec<&str> = decoded.splitn(3, '\0').collect();
-        let (username, password) = match parts.as_slice() {
-            [_, u, p] => (*u, *p),
-            [u, p] => (*u, *p),
-            _ => return StepResult::Reply(Reply::auth_failed()),
-        };
-        self.finish_auth(username, password, verify_auth)
-    }
-
-    fn finish_auth(
-        &mut self,
-        username: &str,
-        password: &str,
-        verify_auth: &dyn Fn(&str, &str) -> Option<String>,
-    ) -> StepResult {
-        match verify_auth(username, password) {
-            Some(user) => {
-                self.auth_user = Some(user);
-                self.state = SessionState::Greeted;
-                StepResult::Reply(Reply::auth_ok())
-            }
-            None => StepResult::Reply(Reply::auth_failed()),
-        }
-    }
 }
 
-// ─── Supporting types ─────────────────────────────────────────────────
-
-pub enum RcptCheck {
-    LocalOk,
-    RelayDenied,
-    UserUnknown,
-}
-
-fn decode_base64(s: &str) -> Option<String> {
-    use std::io::Read;
-    // Use the standard alphabet; empty string is valid (anonymous)
-    if s.is_empty() { return Some(String::new()); }
-    let bytes = {
-        // base64 crate is not in workspace deps; use stdlib decoder via a simple impl
-        // We rely on base64 = "0.22" added to workspace
-        // For now: naive decode via POSIX base64 alphabet
-        // This will be replaced by the `base64` crate at link time.
-        // Placeholder — the linker will pull the crate.
-        s.as_bytes().to_vec()
+fn verify_argon2(password: &str, hash: &str) -> bool {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let parsed = match PasswordHash::new(hash) {
+        Ok(h) => h,
+        Err(_) => return false,
     };
-    String::from_utf8(bytes).ok()
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
 }

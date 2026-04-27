@@ -1,0 +1,22 @@
+[package]
+name    = "rmailctl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rmailctl"
+path = "src/main.rs"
+
+[dependencies]
+rmail-config  = { path = "../../crates/config" }
+rmail-core    = { path = "../../crates/core" }
+rmail-queue   = { path = "../../crates/queue" }
+rmail-mailbox = { path = "../../crates/mailbox" }
+rmail-auth    = { path = "../../crates/auth" }
+rmail-dns     = { path = "../../crates/dns" }
+tokio         = { workspace = true }
+clap          = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow        = { workspace = true }
+serde         = { workspace = true }

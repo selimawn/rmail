@@ -1,87 +1,98 @@
-//! rmail daemon entry point.
+//! rmail daemon — entry point.
 //!
-//! 1. Parse CLI args / load config.
-//! 2. Build shared services (DNS, TLS, Queue, Maildir).
-//! 3. Spawn SMTP listener tasks.
-//! 4. Spawn IMAP listener tasks.
-//! 5. Spawn queue manager.
-//! 6. Block until SIGTERM / SIGINT.
+//! Starts all listeners (SMTP + IMAP) and the queue manager.
+//! All components share Arc references to config, queue, maildir, and resolver.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::info;
+use anyhow::{Context, Result};
 use clap::Parser;
+use tracing::info;
+use rmail_config::Config;
+use rmail_queue::Queue;
+use rmail_mailbox::Maildir;
+use rmail_dns::Resolver;
+use rmail_tls::TlsAcceptor;
 
-#[derive(Parser)]
-#[command(name = "rmail", about = "rmail mail engine daemon")]
-struct Args {
+#[derive(Debug, Parser)]
+#[command(name = "rmail", about = "rmail SMTP/IMAP server")]
+struct Cli {
     #[arg(short, long, default_value = "/etc/rmail/rmail.toml")]
     config: PathBuf,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
+    // Tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rmail=info,rmail_server=info".parse().unwrap()),
+                .unwrap_or_else(|_| "rmail=info,rmail_server=info,rmail_smtp=info,rmail_imap=info".into())
         )
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // ─── Config
-    let config = Arc::new(rmail_config::Config::load(&args.config)?);
+    // Load config
+    let config = Config::load(&cli.config)
+        .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+    let config = Arc::new(config);
     info!(hostname = %config.server.hostname, "rmail starting");
 
-    // ─── DNS (Cloudflare-only)
-    let dns = Arc::new(rmail_dns::Resolver::new(config.dns.dnssec));
+    // Shared state
+    let queue   = Arc::new(Queue::new(config.storage.queue_dir.clone()).await
+        .context("failed to initialise queue directory")?);
+    let maildir = Arc::new(Maildir::new(config.storage.mailbox_dir.clone()));
+    let resolver = Arc::new(Resolver::new(config.dns.dnssec));
+    let tls = Arc::new(TlsAcceptor::from_pem(&config.tls.cert, &config.tls.key)
+        .context("failed to load TLS certificate")?);
 
-    // ─── TLS
-    let tls = Arc::new(rmail_tls::build_acceptor(&config.tls.cert, &config.tls.key)?);
+    info!("shared state initialised");
 
-    // ─── Queue
-    let queue = Arc::new(
-        rmail_queue::Queue::new(config.storage.queue_dir.clone()).await?
-    );
-
-    // ─── Maildir
-    let mailbox = Arc::new(rmail_mailbox::Maildir::new(config.storage.mailbox_dir.clone()));
-
-    // ─── Queue manager channel
-    let (qm_tx, qm_rx) = mpsc::channel::<String>(4096);
-
-    // ─── Queue manager task
-    {
-        let config  = config.clone();
-        let queue   = queue.clone();
-        let mailbox = mailbox.clone();
-        let dns     = dns.clone();
+    // Spawn all tasks
+    let smtp_task = {
+        let (config, queue, tls) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&tls));
         tokio::spawn(async move {
-            rmail_server::queue_manager::run(config, queue, mailbox, dns, qm_rx).await;
-        });
+            rmail_server::smtp_listener::run(
+                config.server.listen_smtp.clone(),
+                config,
+                queue,
+                tls,
+            ).await
+        })
+    };
+
+    let imap_task = {
+        let (config, maildir) = (Arc::clone(&config), Arc::clone(&maildir));
+        tokio::spawn(async move {
+            rmail_server::imap_listener::run(
+                config.server.listen_imap.clone(),
+                config,
+                maildir,
+            ).await
+        })
+    };
+
+    let qmgr_task = {
+        let (config, queue, maildir, resolver) = (
+            Arc::clone(&config),
+            Arc::clone(&queue),
+            Arc::clone(&maildir),
+            Arc::clone(&resolver),
+        );
+        tokio::spawn(async move {
+            rmail_server::queue_manager::run(config, queue, maildir, resolver).await
+        })
+    };
+
+    info!("all listeners started");
+
+    // Wait for first task to finish (should never happen unless error)
+    tokio::select! {
+        r = smtp_task => { r?.context("SMTP listener exited")?; }
+        r = imap_task => { r?.context("IMAP listener exited")?; }
+        r = qmgr_task => { r.context("queue manager panicked")?; }
     }
 
-    // ─── SMTP listeners
-    for addr in &config.server.listen_smtp {
-        let addr    = *addr;
-        let config  = config.clone();
-        let queue   = queue.clone();
-        let mailbox = mailbox.clone();
-        let dns     = dns.clone();
-        let tls     = tls.clone();
-        tokio::spawn(async move {
-            if let Err(e) = rmail_server::smtpd::listen(addr, config, queue, mailbox, dns, tls).await {
-                tracing::error!("SMTP listener {addr} failed: {e}");
-            }
-        });
-    }
-
-    info!("All listeners started. Press Ctrl+C to stop.");
-
-    // Wait for Ctrl+C / SIGTERM
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down.");
     Ok(())
 }

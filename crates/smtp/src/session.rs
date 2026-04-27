@@ -5,8 +5,7 @@
 //! socket. When `step()` returns `Action::Close`, flush and drop.
 
 use std::net::IpAddr;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use tracing::{debug, info, warn};
 use rmail_core::{Address, Envelope};
 use rmail_config::Config;
@@ -14,7 +13,8 @@ use crate::command::{self, Command};
 use crate::reply::Reply;
 
 /// Maximum line length we accept before hard-closing (prevents memory abuse).
-/// Per RFC 5321 §4.5.3.1.6 this applies to both command lines and DATA lines.
+/// RFC 5321 §4.5.3.1.6 specifies max 1000 octets per line, including CRLF.
+/// This applies to DATA body lines as well, not only commands.
 const MAX_LINE: usize = 1000;
 /// Maximum number of RCPT TO per message (anti-abuse).
 const MAX_RCPTS: usize = 100;
@@ -90,10 +90,14 @@ impl Session {
 
     /// Feed a line from the client. Returns what to do next.
     pub fn step(&mut self, line: &[u8], config: &Config) -> Action {
-        // RFC 5321 §4.5.3.1.6: line length limit applies in DATA mode too,
-        // not just to command lines.
         if line.len() > MAX_LINE {
-            warn!(peer = %self.peer_ip, len = line.len(), "line exceeded MAX_LINE; closing");
+            // RFC 5321 §4.5.3.1.6 — applies to DATA body lines too.
+            if self.state == State::Data {
+                // Reject the in-progress message but keep the connection open.
+                self.reset_transaction();
+                self.state = if self.tls_active { State::Tls } else { State::Greeted };
+                return Action::Reply(Reply::new(500, "5.5.6 Line too long").to_wire());
+            }
             return Action::Close(Reply::syntax_error().to_wire());
         }
 
@@ -143,7 +147,7 @@ impl Session {
             Reply::ehlo_caps(
                 &config.server.hostname,
                 config.max_message_bytes(),
-                !self.tls_active,
+                self.tls_active,
             )
             .to_wire(),
         )
@@ -167,6 +171,22 @@ impl Session {
         }
         match Address::parse(&address) {
             Ok(addr) => {
+                // Anti-spoofing: an authenticated submission may only declare
+                // a sender that matches the authenticated identity. The null
+                // reverse-path `<>` is allowed for DSN/bounce generation.
+                if let Some(ref user) = self.auth_user {
+                    if !addr.is_null() && !user.eq_ignore_ascii_case(&addr.as_str()) {
+                        warn!(
+                            peer = %self.peer_ip,
+                            %user,
+                            claimed = %addr,
+                            "MAIL FROM spoofing rejected"
+                        );
+                        return Action::Reply(
+                            Reply::new(553, "5.7.1 Sender address not owned by authenticated user").to_wire(),
+                        );
+                    }
+                }
                 self.from = Some(addr);
                 self.state = State::Mailing;
                 Action::Reply(Reply::ok_msg("2.1.0 OK").to_wire())
@@ -256,34 +276,27 @@ impl Session {
 
     fn do_auth_plain(&mut self, initial: Option<String>, config: &Config) -> Action {
         if !self.tls_active {
-            warn!(peer = %self.peer_ip, "AUTH PLAIN refused: TLS not active");
-            return Action::Reply(
-                Reply::new(538, "5.7.11 Encryption required for authentication").to_wire(),
-            );
+            warn!(peer = %self.peer_ip, "AUTH PLAIN attempted without TLS");
+            return Action::Reply(Reply::tls_required().to_wire());
         }
         let blob = match initial {
             Some(b) => b,
             None    => return Action::Reply(Reply::auth_continue("").to_wire()),
         };
-        match verify_plain(&blob, config) {
-            Some(user) => {
-                info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
-                self.auth_user = Some(user);
-                Action::Reply(Reply::auth_ok().to_wire())
-            }
-            None => {
-                warn!(peer = %self.peer_ip, "AUTH PLAIN failed");
-                Action::Reply(Reply::auth_fail().to_wire())
-            }
+        if let Some(user) = verify_plain(&blob, config) {
+            info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
+            self.auth_user = Some(user);
+            Action::Reply(Reply::auth_ok().to_wire())
+        } else {
+            warn!(peer = %self.peer_ip, "AUTH PLAIN failed");
+            Action::Reply(Reply::auth_fail().to_wire())
         }
     }
 
     fn do_auth_login(&mut self) -> Action {
         if !self.tls_active {
-            warn!(peer = %self.peer_ip, "AUTH LOGIN refused: TLS not active");
-            return Action::Reply(
-                Reply::new(538, "5.7.11 Encryption required for authentication").to_wire(),
-            );
+            warn!(peer = %self.peer_ip, "AUTH LOGIN attempted without TLS");
+            return Action::Reply(Reply::tls_required().to_wire());
         }
         self.state = State::AuthLoginPass { username: String::new() };
         Action::Reply(Reply::auth_continue("VXNlcm5hbWU6").to_wire())
@@ -295,8 +308,16 @@ impl Session {
             self.state = State::AuthLoginPass { username: line_str.to_owned() };
             return Action::Reply(Reply::auth_continue("UGFzc3dvcmQ6").to_wire());
         }
-        let user = decode_b64(username_b64);
-        let pass = decode_b64(line_str);
+        let Some(user) = decode_b64(username_b64) else {
+            warn!(peer = %self.peer_ip, "AUTH LOGIN: invalid base64 username");
+            self.state = State::Greeted;
+            return Action::Reply(Reply::auth_fail().to_wire());
+        };
+        let Some(pass) = decode_b64(line_str) else {
+            warn!(peer = %self.peer_ip, %user, "AUTH LOGIN: invalid base64 password");
+            self.state = State::Greeted;
+            return Action::Reply(Reply::auth_fail().to_wire());
+        };
         if let Some(u) = config.find_user(&user) {
             if rmail_auth::password::verify(&pass, &u.password_hash) {
                 info!(peer = %self.peer_ip, %user, "AUTH LOGIN success");
@@ -305,7 +326,7 @@ impl Session {
                 return Action::Reply(Reply::auth_ok().to_wire());
             }
         }
-        warn!(peer = %self.peer_ip, attempted_user = %user, "AUTH LOGIN failed");
+        warn!(peer = %self.peer_ip, %user, "AUTH LOGIN failed");
         self.state = State::Greeted;
         Action::Reply(Reply::auth_fail().to_wire())
     }
@@ -330,13 +351,10 @@ impl Session {
 
 // ─── auth helpers ────────────────────────────────────────────────────────────
 
-/// Decode a base64 SASL token. Returns an empty string on invalid input —
-/// callers must treat empty as auth failure.
-fn decode_b64(s: &str) -> String {
-    match B64.decode(s.trim()) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => String::new(),
-    }
+/// Decode a base64-encoded UTF-8 string. Returns `None` on invalid input.
+fn decode_b64(s: &str) -> Option<String> {
+    let bytes = B64.decode(s.trim()).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Verify AUTH PLAIN blob: `\0user\0password` (base64-encoded).

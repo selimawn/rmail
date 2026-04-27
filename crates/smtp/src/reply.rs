@@ -56,17 +56,22 @@ impl Reply {
         Self::new(250, msg)
     }
 
-    pub fn ehlo_caps(hostname: &str, max_size: u64, tls: bool) -> Self {
+    /// EHLO capability lines.
+    /// `tls_active` = whether the current session is already running over TLS.
+    /// We advertise STARTTLS only before TLS is established and AUTH only after,
+    /// so credentials never travel in cleartext.
+    pub fn ehlo_caps(hostname: &str, max_size: u64, tls_active: bool) -> Self {
         let mut lines = vec![
             hostname.to_owned(),
             format!("SIZE {}", max_size),
             "8BITMIME".to_owned(),
             "SMTPUTF8".to_owned(),
         ];
-        if tls {
+        if !tls_active {
             lines.push("STARTTLS".to_owned());
+        } else {
+            lines.push("AUTH PLAIN LOGIN".to_owned());
         }
-        lines.push("AUTH PLAIN LOGIN".to_owned());
         Self::multiline(250, lines)
     }
 
@@ -151,5 +156,21 @@ mod tests {
         let wire = String::from_utf8(r.to_wire()).unwrap();
         assert!(wire.starts_with("250-example.com\r\n"));
         assert!(wire.ends_with("250 STARTTLS\r\n"));
+    }
+
+    #[test]
+    fn ehlo_caps_pre_tls_advertises_starttls_not_auth() {
+        let r = Reply::ehlo_caps("mail.example.com", 26214400, false);
+        let wire = String::from_utf8(r.to_wire()).unwrap();
+        assert!(wire.contains("STARTTLS"));
+        assert!(!wire.contains("AUTH"));
+    }
+
+    #[test]
+    fn ehlo_caps_post_tls_advertises_auth_not_starttls() {
+        let r = Reply::ehlo_caps("mail.example.com", 26214400, true);
+        let wire = String::from_utf8(r.to_wire()).unwrap();
+        assert!(!wire.contains("STARTTLS"));
+        assert!(wire.contains("AUTH PLAIN LOGIN"));
     }
 }

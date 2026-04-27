@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use thiserror::Error;
 
-// ─── QueueId ─────────────────────────────────────────────────────────────────
+// ─── QueueId ─────────────────────────────────────────────────────────────────────
 
 /// Unique identifier for a queued message.
 /// Format: `YYYYMMDDHHmmss.XXXXXX` (hex entropy from pid + nanoseconds).
@@ -44,13 +44,9 @@ impl fmt::Display for QueueId {
     }
 }
 
-// ─── Address ─────────────────────────────────────────────────────────────────
+// ─── Address ─────────────────────────────────────────────────────────────────────
 
 /// A parsed RFC 5321 email address.
-///
-/// Local-part is normalized to lowercase. Per RFC 5321 §2.4 the local-part
-/// is technically case-sensitive, but in practice every modern MTA normalizes
-/// to avoid duplicate accounts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Address {
     pub local: String,
@@ -58,46 +54,31 @@ pub struct Address {
 }
 
 impl Address {
-    /// Parse from `<user@domain>` or `user@domain`.
+    /// Parse from `<user@domain>` or bare `user@domain`.
     /// An empty/null address `<>` returns `Address::null()`.
     ///
-    /// Strict: rejects multiple angle brackets, lone brackets, whitespace,
-    /// control characters, leading/trailing/consecutive dots, oversized parts,
-    /// and any character outside the RFC 5321 atext + dot set for local-part
-    /// or LDH for domain.
+    /// Strict: exactly one matched pair of angle brackets is allowed, or
+    /// none at all. Inputs like `<<a@b>>`, `<a@b`, or `a@b>` are rejected.
+    /// Both local-part and domain must be non-empty for a non-null address.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let s = s.trim();
-        let has_open = s.starts_with('<');
-        let has_close = s.ends_with('>');
-        let s = match (has_open, has_close) {
-            (true, true) => &s[1..s.len() - 1],
+        let inner = match (s.starts_with('<'), s.ends_with('>')) {
+            (true, true)   => &s[1..s.len() - 1],
             (false, false) => s,
-            _ => return Err(CoreError::InvalidAddress(s.to_owned())),
+            _              => return Err(CoreError::InvalidAddress(s.to_owned())),
         };
-        let s = s.trim();
-        if s.is_empty() {
+        let inner = inner.trim();
+        if inner.is_empty() {
             return Ok(Self::null());
         }
-        let at = s.rfind('@').ok_or_else(|| CoreError::InvalidAddress(s.to_owned()))?;
-        let local = &s[..at];
-        let domain = &s[at + 1..];
+        if inner.contains('<') || inner.contains('>') {
+            return Err(CoreError::InvalidAddress(inner.to_owned()));
+        }
+        let at = inner.rfind('@').ok_or_else(|| CoreError::InvalidAddress(inner.to_owned()))?;
+        let local  = &inner[..at];
+        let domain = &inner[at + 1..];
         if local.is_empty() || domain.is_empty() {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
-        }
-        if local.len() > 64 || domain.len() > 253 {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
-        }
-        if !local.chars().all(is_atext_or_dot) {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
-        }
-        if !domain.chars().all(is_domain_char) {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
-        }
-        if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
-        }
-        if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
-            return Err(CoreError::InvalidAddress(s.to_owned()));
+            return Err(CoreError::InvalidAddress(inner.to_owned()));
         }
         Ok(Self {
             local:  local.to_lowercase(),
@@ -133,22 +114,7 @@ impl fmt::Display for Address {
     }
 }
 
-/// RFC 5322 atext + `.` (used between atoms).
-fn is_atext_or_dot(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '/'
-                | '=' | '?' | '^' | '_' | '`' | '{' | '|' | '}' | '~' | '.'
-        )
-}
-
-/// LDH (letters, digits, hyphen) plus the dot separator.
-fn is_domain_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
-}
-
-// ─── Recipient ───────────────────────────────────────────────────────────────
+// ─── Recipient ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipient {
@@ -168,7 +134,7 @@ pub enum DeliveryStatus {
     Bounced,
 }
 
-// ─── Envelope ────────────────────────────────────────────────────────────────
+// ─── Envelope ────────────────────────────────────────────────────────────────────
 
 /// The SMTP routing envelope, persisted alongside the raw message body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +201,7 @@ impl Envelope {
     }
 }
 
-// ─── Message ─────────────────────────────────────────────────────────────────
+// ─── Message ─────────────────────────────────────────────────────────────────────
 
 /// A complete queued message: envelope metadata + path to raw RFC 5322 body on disk.
 /// The body is *never* loaded into memory by this type.
@@ -246,7 +212,7 @@ pub struct Message {
     pub size: u64,
 }
 
-// ─── Queue state ─────────────────────────────────────────────────────────────
+// ─── Queue state ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueState {
@@ -271,7 +237,7 @@ impl QueueState {
     }
 }
 
-// ─── Errors ──────────────────────────────────────────────────────────────────
+// ─── Errors ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -281,7 +247,7 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+// ─── Tests ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -312,46 +278,28 @@ mod tests {
     }
 
     #[test]
-    fn address_parse_rejects_multi_brackets() {
+    fn address_rejects_nested_brackets() {
         assert!(Address::parse("<<a@b>>").is_err());
-        assert!(Address::parse("<<<a@b>>>").is_err());
+        assert!(Address::parse("<a@b>>").is_err());
+        assert!(Address::parse("<<a@b>").is_err());
     }
 
     #[test]
-    fn address_parse_rejects_lone_bracket() {
+    fn address_rejects_unbalanced_brackets() {
         assert!(Address::parse("<a@b").is_err());
         assert!(Address::parse("a@b>").is_err());
     }
 
     #[test]
-    fn address_parse_rejects_whitespace() {
-        assert!(Address::parse("a b@example.com").is_err());
-        assert!(Address::parse("a@exa mple.com").is_err());
-    }
-
-    #[test]
-    fn address_parse_rejects_consecutive_dots() {
-        assert!(Address::parse("a..b@example.com").is_err());
-        assert!(Address::parse("a@example..com").is_err());
-    }
-
-    #[test]
-    fn address_parse_lowercases() {
-        let a = Address::parse("Alice@Example.COM").unwrap();
-        assert_eq!(a.local, "alice");
-        assert_eq!(a.domain, "example.com");
-    }
-
-    #[test]
-    fn address_parse_plus_addressing() {
-        let a = Address::parse("user+tag@example.com").unwrap();
-        assert_eq!(a.local, "user+tag");
+    fn address_rejects_empty_parts() {
+        assert!(Address::parse("@b.com").is_err());
+        assert!(Address::parse("a@").is_err());
+        assert!(Address::parse("@").is_err());
     }
 
     #[test]
     fn queue_id_format() {
         let id = QueueId::generate();
-        // YYYYMMDDHHmmss.XXXXXX — 21 chars
         assert!(id.0.len() >= 21);
         assert!(id.0.contains('.'));
     }

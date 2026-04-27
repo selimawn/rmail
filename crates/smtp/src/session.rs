@@ -93,7 +93,6 @@ impl Session {
         if line.len() > MAX_LINE {
             // RFC 5321 §4.5.3.1.6 — applies to DATA body lines too.
             if self.state == State::Data {
-                // Reject the in-progress message but keep the connection open.
                 self.reset_transaction();
                 self.state = if self.tls_active { State::Tls } else { State::Greeted };
                 return Action::Reply(Reply::new(500, "5.5.6 Line too long").to_wire());
@@ -235,11 +234,11 @@ impl Session {
         Action::Reply(Reply::ok().to_wire())
     }
 
-    // ─── DATA body accumulation ───────────────────────────────────────────────
+    // ─── DATA body accumulation ────────────────────────────────────────────────
 
-    fn handle_data_line(&mut self, line: &[u8], _config: &Config) -> Action {
+    fn handle_data_line(&mut self, line: &[u8], config: &Config) -> Action {
         if line == b".\r\n" || line == b".\n" || line == b"." {
-            return self.finalize_data();
+            return self.finalize_data(config);
         }
         let line = if line.starts_with(b"..") { &line[1..] } else { line };
         if self.body_buf.len() + line.len() > self.max_size as usize {
@@ -251,10 +250,10 @@ impl Session {
         Action::Reply(vec![])
     }
 
-    fn finalize_data(&mut self) -> Action {
+    fn finalize_data(&mut self, config: &Config) -> Action {
         let from  = self.from.take().unwrap_or_else(Address::null);
         let rcpts = std::mem::take(&mut self.rcpts);
-        let body  = std::mem::take(&mut self.body_buf);
+        let raw   = std::mem::take(&mut self.body_buf);
         let envelope = Envelope::new(
             from,
             rcpts,
@@ -262,6 +261,9 @@ impl Session {
             self.helo.clone(),
             self.auth_user.clone(),
         );
+        // Prepend Received: trace header (RFC 5321 §3.7.2). Required for all
+        // accepted mail; downstream MTAs use it for loop detection.
+        let body = prepend_received(&raw, &envelope, &config.server.hostname);
         let id = envelope.id.to_string();
         info!(id, peer = %self.peer_ip, "message accepted");
         self.state = if self.tls_active { State::Tls } else { State::Greeted };
@@ -331,7 +333,7 @@ impl Session {
         Action::Reply(Reply::auth_fail().to_wire())
     }
 
-    // ─── helpers ──────────────────────────────────────────────────────────────
+    // ─── helpers ─────────────────────────────────────────────────────────────────
 
     fn reset_transaction(&mut self) {
         self.from = None;
@@ -349,7 +351,7 @@ impl Session {
     }
 }
 
-// ─── auth helpers ────────────────────────────────────────────────────────────
+// ─── module-private helpers ──────────────────────────────────────────────────────────────
 
 /// Decode a base64-encoded UTF-8 string. Returns `None` on invalid input.
 fn decode_b64(s: &str) -> Option<String> {
@@ -370,4 +372,33 @@ fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Build the `Received:` trace header per RFC 5321 §3.7.2 and prepend it
+/// to the raw message body. Header insertion happens here — *before* the
+/// message is enqueued — so it is part of the original on-disk write and
+/// cannot be duplicated by retries.
+fn prepend_received(body: &[u8], envelope: &Envelope, our_hostname: &str) -> Vec<u8> {
+    let ts = envelope.received_at
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let first_rcpt = envelope.recipients.first()
+        .map(|r| r.address.to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+    let with = if envelope.auth_user.is_some() { "ESMTPSA" } else { "ESMTP" };
+    let header = format!(
+        "Received: from {} ({} [{}])\r\n\tby {} (rmail) with {} id {}\r\n\tfor {}; {}\r\n",
+        envelope.client_helo,
+        envelope.client_helo,
+        envelope.client_ip,
+        our_hostname,
+        with,
+        envelope.id,
+        first_rcpt,
+        ts,
+    );
+    let mut out = Vec::with_capacity(header.len() + body.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(body);
+    out
 }

@@ -1,62 +1,68 @@
 //! DKIM verification (inbound) and signing (outbound).
 //! Uses `mail-auth` 0.5.
-//!
-//! Both verify() and sign() are stubs for now. Full implementation requires
-//! wiring in a DNS resolver and determining the exact mail-auth 0.5 signing API.
-//! TODO: implement once resolver integration is complete (Phase 10).
 
-use mail_auth::AuthenticatedMessage;
+use mail_auth::{
+    AuthenticatedMessage,
+    common::crypto::{RsaKey, Sha256},
+    dkim::DkimSigner,
+};
 use tracing::debug;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DkimVerdict {
-    Pass,
-    Fail,
-    PermError,
-    TempError,
-    None,
-}
+pub enum DkimVerdict { Pass, Fail, PermError, TempError, None }
 
 impl std::fmt::Display for DkimVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
+        f.write_str(match self {
             Self::Pass      => "pass",
             Self::Fail      => "fail",
             Self::PermError => "permerror",
             Self::TempError => "temperror",
             Self::None      => "none",
-        };
-        f.write_str(s)
+        })
     }
 }
 
-/// Verify all DKIM-Signature headers in a raw message.
-///
-/// Stub: parses the message (validates basic structure) but does not
-/// perform DNS lookups or cryptographic verification yet.
+/// Stub: verify is handled by checker.rs using mail-auth's full resolver pipeline.
+/// This function is kept for direct/unit-test use.
 pub async fn verify(raw_message: &[u8]) -> DkimVerdict {
-    let _msg = match AuthenticatedMessage::parse(raw_message) {
-        Some(m) => m,
-        Option::None => return DkimVerdict::None,
-    };
-    // TODO: wire up DNS resolver and call resolver.verify_dkim(&_msg).await
-    debug!("DKIM verify (stub — returning None)");
-    DkimVerdict::None
+    match AuthenticatedMessage::parse(raw_message) {
+        Some(_) => {
+            debug!("DKIM verify (use checker::verify for full DNS-based verification)");
+            DkimVerdict::None
+        }
+        Option::None => DkimVerdict::PermError,
+    }
 }
 
-/// Sign a message with an RSA private key.
-///
-/// Stub: returns the message unchanged until the signing API is wired up.
+/// Sign a raw RFC 5322 message with an RSA-SHA256 DKIM signature.
+/// Prepends the `DKIM-Signature:` header to the message.
 pub fn sign(
     raw_message: &[u8],
-    _domain: &str,
-    _selector: &str,
-    _private_key_pem: &[u8],
+    domain: &str,
+    selector: &str,
+    private_key_pem: &[u8],
 ) -> Result<Vec<u8>, DkimError> {
-    // TODO: implement DKIM signing with mail-auth 0.5 API
-    debug!("DKIM sign (stub — returning unsigned message)");
-    Ok(raw_message.to_vec())
+    let pk = RsaKey::<Sha256>::from_pkcs8_pem(
+        std::str::from_utf8(private_key_pem)
+            .map_err(|e| DkimError::Sign(e.to_string()))?,
+    ).map_err(|e| DkimError::Sign(e.to_string()))?;
+
+    let signature = DkimSigner::from_key(pk)
+        .domain(domain)
+        .selector(selector)
+        .headers(["From", "To", "Subject", "Date", "Message-ID",
+                  "MIME-Version", "Content-Type"])
+        .sign(raw_message)
+        .map_err(|e| DkimError::Sign(e.to_string()))?;
+
+    let header_line = signature.to_header();
+    let mut out = Vec::with_capacity(header_line.len() + 2 + raw_message.len());
+    out.extend_from_slice(header_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(raw_message);
+    Ok(out)
 }
 
 #[derive(Debug, Error)]

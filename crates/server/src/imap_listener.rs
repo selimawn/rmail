@@ -66,7 +66,8 @@ async fn handle(
         let mut line = Vec::new();
         let n = io.read_until(b'\n', &mut line).await?;
         if n == 0 { break; }
-        let out = session.step(&line, &config, &maildir);
+        // step() is now async
+        let out = session.step(&line, &config, &maildir).await;
         if !out.is_empty() { io.get_mut().write_all(&out).await?; }
         if session.is_closed() { break; }
     }

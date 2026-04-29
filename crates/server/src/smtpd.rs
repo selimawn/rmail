@@ -1,21 +1,19 @@
-//! SMTP listener: accepts inbound connections on port 25 / 587 / 465.
-//!
-//! One Tokio task per accepted connection. A global semaphore caps concurrent sessions.
+//! SMTP session handler — one Tokio task per accepted connection.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn, debug};
+use tracing::{error, info, warn};
 use rmail_config::Config;
 use rmail_dns::Resolver;
 use rmail_queue::Queue;
 use rmail_mailbox::Maildir;
 use rmail_smtp::{
-    command::parse_command,
+    command,           // FIX: was `command::parse_command` (non-existent)
     reply::Reply,
-    session::{SmtpSession, RcptCheck, StepResult},
+    session::{SmtpSession, RcptCheck, StepResult, SessionState},
 };
 use rmail_tls::TlsAcceptor;
 use rmail_core::{Address, QueueState};
@@ -36,7 +34,7 @@ pub async fn listen(
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = sem.clone().acquire_owned().await?;
+        let permit  = sem.clone().acquire_owned().await?;
         let config  = config.clone();
         let queue   = queue.clone();
         let mailbox = mailbox.clone();
@@ -53,7 +51,7 @@ pub async fn listen(
 }
 
 async fn handle_session(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
     queue: Arc<Queue>,
@@ -63,41 +61,69 @@ async fn handle_session(
 ) -> anyhow::Result<()> {
     info!(peer = %peer, "SMTP connection");
 
-    // Greeting
     let greeting = Reply::greeting(&config.server.hostname).to_string();
     stream.write_all(greeting.as_bytes()).await?;
 
     let max_bytes = config.max_message_bytes();
     let mut session = SmtpSession::new(&config.server.hostname, max_bytes, peer.ip());
-    session.state = rmail_smtp::session::SessionState::Connected;
+    session.state = SessionState::Connected;
 
-    // Line reader — plain TCP for now; STARTTLS handled inline
     let mut reader = BufReader::new(stream);
-    let mut line   = String::new();
+
+    // FIX: after STARTTLS, continue session loop on TLS stream
+    if let Some(tls_stream) = run_command_loop(
+        &mut reader, &mut session, peer, &config, &queue, &mailbox,
+    ).await? {
+        // TLS upgrade requested — perform handshake
+        let plain = reader.into_inner();
+        match tls.accept(plain).await {  // FIX: was rmail_tls::upgrade() (non-existent)
+            Ok(tls_stream) => {
+                session.tls_upgraded();
+                info!(peer = %peer, "STARTTLS upgrade complete");
+                let mut tls_reader = BufReader::new(tls_stream);
+                run_command_loop(&mut tls_reader, &mut session, peer, &config, &queue, &mailbox).await?;
+            }
+            Err(e) => warn!(peer = %peer, "STARTTLS failed: {}", e),
+        }
+    }
+
+    info!(peer = %peer, "SMTP connection closed");
+    Ok(())
+}
+
+/// Returns `Some(stream)` if a STARTTLS upgrade is needed, `None` when done.
+async fn run_command_loop<S>(
+    reader: &mut BufReader<S>,
+    session: &mut SmtpSession,
+    peer: SocketAddr,
+    config: &Arc<Config>,
+    queue: &Arc<Queue>,
+    mailbox: &Arc<Maildir>,
+) -> anyhow::Result<Option<()>>
+where
+    S: AsyncBufRead + AsyncWrite + Unpin,
+{
     let mut in_data = false;
+    let mut line = String::new();
 
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // client disconnected
-        }
+        if n == 0 { return Ok(None); }
 
-        // DATA body phase
         if in_data {
             if let Some(result) = session.feed_data(
                 line.as_bytes(),
-                &|addr| check_rcpt(addr, &config, &mailbox),
-                &|u, p| verify_auth(u, p, &config),
+                &|addr| check_rcpt(addr, config, mailbox),
+                &|u, p| verify_auth(u, p, config),
             ) {
                 match result {
                     StepResult::MessageComplete { envelope, body } => {
                         in_data = false;
                         let id = queue.enqueue(envelope, &body).await
-                            .map_err(|e| anyhow::anyhow!(e))?;
+                            .map_err(|e| anyhow::anyhow!("{}", e))?;
                         let reply = Reply::ok(format!("2.0.0 OK queued as {}", id));
                         reader.get_mut().write_all(reply.to_string().as_bytes()).await?;
-                        // Notify queue manager (fire-and-forget via channel — wired in main)
                     }
                     StepResult::Reply(r) => {
                         reader.get_mut().write_all(r.to_string().as_bytes()).await?;
@@ -109,9 +135,9 @@ async fn handle_session(
             continue;
         }
 
-        // Command phase
-        let cmd = match parse_command(&line) {
-            Ok(c) => c,
+        // FIX: was `parse_command` — function is `parse` in command.rs
+        let cmd = match command::parse(&line) {
+            Ok(c)  => c,
             Err(_) => {
                 reader.get_mut().write_all(Reply::syntax_error().to_string().as_bytes()).await?;
                 continue;
@@ -120,48 +146,32 @@ async fn handle_session(
 
         let result = session.step(
             cmd,
-            &|addr| check_rcpt(addr, &config, &mailbox),
-            &|u, p| verify_auth(u, p, &config),
+            &|addr| check_rcpt(addr, config, mailbox),
+            &|u, p| verify_auth(u, p, config),
         );
 
         match result {
             StepResult::Reply(r) => {
-                reader.get_mut().write_all(r.to_string().as_bytes()).await?;
-                if r.to_string().starts_with("354") {
-                    in_data = true;
-                }
+                let s = r.to_string();
+                let starts_data = s.starts_with("354");
+                reader.get_mut().write_all(s.as_bytes()).await?;
+                if starts_data { in_data = true; }
             }
             StepResult::UpgradeTls(r) => {
-                let stream = reader.into_inner();
-                stream.write_all(r.to_string().as_bytes()).await?;
-                // TLS upgrade
-                match rmail_tls::upgrade(&tls, stream).await {
-                    Ok(tls_stream) => {
-                        session.tls_upgraded();
-                        info!(peer = %peer, "STARTTLS upgrade complete");
-                        // Continue session on TLS stream
-                        // (simplified: real impl wraps into BufReader again)
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer, "STARTTLS failed: {}", e);
-                        return Ok(());
-                    }
-                }
+                reader.get_mut().write_all(r.to_string().as_bytes()).await?;
+                // Signal to caller that TLS upgrade is needed
+                return Ok(Some(()));
             }
-            StepResult::MessageComplete { .. } => {} // handled in data loop
+            StepResult::MessageComplete { .. } => {}
             StepResult::Close(r) => {
                 reader.get_mut().write_all(r.to_string().as_bytes()).await?;
-                break;
+                return Ok(None);
             }
         }
     }
-
-    info!(peer = %peer, "SMTP connection closed");
-    Ok(())
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn check_rcpt(addr: &Address, config: &Config, mailbox: &Maildir) -> RcptCheck {
     if !config.is_local_domain(&addr.domain) {
@@ -176,7 +186,8 @@ fn check_rcpt(addr: &Address, config: &Config, mailbox: &Maildir) -> RcptCheck {
 
 fn verify_auth(username: &str, password: &str, config: &Config) -> Option<String> {
     let user = config.find_user(username)?;
-    if rmail_auth::password::verify_password(password, &user.password_hash) {
+    // FIX: was verify_password — function is `verify` in auth/password.rs
+    if rmail_auth::password::verify(password, &user.password_hash) {
         Some(user.address.clone())
     } else {
         None

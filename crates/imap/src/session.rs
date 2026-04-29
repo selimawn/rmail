@@ -80,7 +80,7 @@ impl Session {
                 Response::ok(tag, "CLOSE completed").to_wire()
             }
             Command::Idle => Response::untagged("+ idling").to_wire(),
-            Command::Search(criteria) => {
+            Command::Search(_criteria) => {
                 // Stub: return all sequence numbers
                 let mut out = Response::untagged("SEARCH").to_wire();
                 out.extend(Response::ok(tag, "SEARCH completed").to_wire());

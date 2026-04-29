@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use rmail_config::Config;
 use rmail_queue::Queue;
 use rmail_mailbox::Maildir;
-use rmail_core::{QueueState, DeliveryStatus};
+use rmail_core::QueueState;
 use rmail_dns::Resolver;
 
 pub async fn run(

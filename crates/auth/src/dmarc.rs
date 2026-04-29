@@ -3,8 +3,6 @@
 
 use mail_auth::{
     AuthenticatedMessage,
-    DmarcOutput,
-    dmarc::Policy,
 };
 use tracing::debug;
 use crate::dkim::DkimVerdict;

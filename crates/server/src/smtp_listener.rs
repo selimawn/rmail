@@ -137,7 +137,7 @@ async fn handle_tls(
             }
             Action::Enqueue { envelope, body, reply } => {
                 match queue.enqueue(envelope, &body).await {
-                    Ok(id) => { io.get_mut().write_all(&reply).await?; }
+                    Ok(_id) => { io.get_mut().write_all(&reply).await?; }
                     Err(e) => {
                         error!("queue error: {}", e);
                         let err = rmail_smtp::reply::Reply::insufficient_storage().to_wire();

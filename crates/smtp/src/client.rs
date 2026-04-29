@@ -71,14 +71,12 @@ pub async fn deliver(
     }
 
     // RCPT TO for all pending recipients
-    let mut last_rcpt_result = DeliveryResult { code: 250, message: "OK".into() };
     for rcpt in envelope.pending_recipients() {
         let rcpt_cmd = format!("RCPT TO:{}\r\n", rcpt.address);
         let r = send_recv(&mut io, &rcpt_cmd).await?;
         if !r.is_success() {
             warn!(addr = %rcpt.address, code = r.code, "RCPT failed");
         }
-        last_rcpt_result = r;
     }
 
     // DATA
@@ -104,20 +102,9 @@ pub async fn deliver(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-struct SmtpReply {
-    code: u16,
-    message: String,
-    is_success: bool,
-}
-
-impl SmtpReply {
-    fn is_success(&self) -> bool { self.code / 100 == 2 }
-}
-
 async fn read_reply<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<DeliveryResult, ClientError> {
     let mut full = String::new();
-    let mut code = 0u16;
-    loop {
+    let code = loop {
         let mut line = String::new();
         if r.read_line(&mut line).await? == 0 {
             return Err(ClientError::Eof);
@@ -125,15 +112,14 @@ async fn read_reply<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<DeliveryRes
         let trimmed = line.trim_end();
         if trimmed.len() < 3 { return Err(ClientError::Eof); }
         let c: u16 = trimmed[..3].parse().map_err(|_| ClientError::Eof)?;
-        code = c;
         let rest = &trimmed[4..];
         full.push_str(rest);
         // `NNN ` = last line; `NNN-` = continuation
         if trimmed.len() < 4 || &trimmed[3..4] == " " {
-            break;
+            break c;
         }
         full.push('\n');
-    }
+    };
     Ok(DeliveryResult { code, message: full })
 }
 

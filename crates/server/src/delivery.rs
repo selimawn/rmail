@@ -1,9 +1,9 @@
 //! Outbound SMTP delivery worker.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, warn};
-use rmail_core::{Envelope, DeliveryStatus};
+use rmail_core::Envelope;
 use rmail_config::Config;
 use rmail_dns::Resolver;
 use rmail_smtp::client;

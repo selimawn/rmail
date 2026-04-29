@@ -6,6 +6,7 @@ use mail_auth::{
     common::crypto::{RsaKey, Sha256},
     dkim::DkimSigner,
 };
+use mail_auth::common::headers::HeaderWriter;
 use tracing::debug;
 use thiserror::Error;
 

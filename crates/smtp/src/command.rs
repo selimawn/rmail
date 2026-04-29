@@ -5,7 +5,7 @@
 
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while, take_while1},
+    bytes::complete::{tag_no_case, take_while, take_while1},
     character::complete::{space0, space1},
     combinator::{map, opt, rest},
     sequence::{preceded, tuple},

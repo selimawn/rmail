@@ -1,7 +1,5 @@
 //! IMAP response formatting.
 
-use std::fmt;
-
 #[derive(Debug, Clone)]
 pub struct Response {
     pub tag:  String, // "*" for untagged, tag for tagged

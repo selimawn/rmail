@@ -1,10 +1,11 @@
 //! DMARC policy evaluation.
 //! Uses `mail-auth` 0.5.
 
-use crate::dkim::DkimVerdict;
-use crate::spf::SpfVerdict;
-use mail_auth::AuthenticatedMessage;
-use tracing::debug;
+use mail_auth::{
+    dmarc::Policy, AuthenticatedMessage, DmarcResult, Resolver as MailAuthResolver,
+};
+use std::net::IpAddr;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmarcVerdict {
@@ -29,16 +30,52 @@ impl std::fmt::Display for DmarcVerdict {
     }
 }
 
-/// Evaluate DMARC policy.
+/// Evaluate DMARC policy for an inbound message.
 ///
-/// NOTE: Full evaluation requires a DNS-backed resolver. This stub
-/// returns None and will be replaced once resolver integration is complete.
-pub async fn evaluate(raw_message: &[u8], spf: &SpfVerdict, dkim: &DkimVerdict) -> DmarcVerdict {
-    let _msg = match AuthenticatedMessage::parse(raw_message) {
+/// Runs SPF and DKIM checks internally then applies the sender domain's DMARC policy.
+/// For the full inbound auth pipeline with a shared `AuthResults`, prefer `checker::verify`.
+pub async fn evaluate(
+    raw_message: &[u8],
+    mail_from: &str,
+    mail_from_domain: &str,
+    client_ip: IpAddr,
+    helo: &str,
+    server_hostname: &str,
+) -> DmarcVerdict {
+    let resolver = match MailAuthResolver::new_cloudflare_tls() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Cannot build mail-auth resolver: {e}");
+            return DmarcVerdict::None;
+        }
+    };
+
+    let auth_msg = match AuthenticatedMessage::parse(raw_message) {
         Some(m) => m,
         Option::None => return DmarcVerdict::None,
     };
-    // TODO: wire up DNS resolver and call resolver.verify_dmarc(&msg).await
-    debug!(spf = %spf, dkim = %dkim, "DMARC check (stub — returning None)");
-    DmarcVerdict::None
+
+    let spf = resolver
+        .verify_spf(client_ip, helo, server_hostname, mail_from)
+        .await;
+    let dkim_results = resolver.verify_dkim(&auth_msg).await;
+
+    let dmarc_output = resolver
+        .verify_dmarc(&auth_msg, &dkim_results, mail_from_domain, &spf, |d| d)
+        .await;
+
+    let pass = matches!(dmarc_output.spf_result(), DmarcResult::Pass)
+        || matches!(dmarc_output.dkim_result(), DmarcResult::Pass);
+
+    let verdict = if pass {
+        DmarcVerdict::Pass
+    } else {
+        match dmarc_output.policy() {
+            Policy::Reject => DmarcVerdict::Reject,
+            Policy::Quarantine => DmarcVerdict::Quarantine,
+            Policy::None | Policy::Unspecified => DmarcVerdict::None,
+        }
+    };
+    debug!(%mail_from_domain, result = %verdict, "DMARC");
+    verdict
 }

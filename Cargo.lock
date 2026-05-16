@@ -1347,6 +1347,7 @@ dependencies = [
  "rmail-auth",
  "rmail-config",
  "rmail-core",
+ "rmail-tls",
  "thiserror 1.0.69",
  "time",
  "tokio",

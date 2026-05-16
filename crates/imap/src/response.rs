@@ -2,7 +2,7 @@
 
 #[derive(Debug, Clone)]
 pub struct Response {
-    pub tag:  String, // "*" for untagged, tag for tagged
+    pub tag: String, // "*" for untagged, tag for tagged
     pub kind: ResponseKind,
     pub text: String,
 }
@@ -20,33 +20,53 @@ pub enum ResponseKind {
 
 impl Response {
     pub fn ok(tag: &str, text: impl Into<String>) -> Self {
-        Self { tag: tag.to_owned(), kind: ResponseKind::Ok, text: text.into() }
+        Self {
+            tag: tag.to_owned(),
+            kind: ResponseKind::Ok,
+            text: text.into(),
+        }
     }
 
     pub fn no(tag: &str, text: impl Into<String>) -> Self {
-        Self { tag: tag.to_owned(), kind: ResponseKind::No, text: text.into() }
+        Self {
+            tag: tag.to_owned(),
+            kind: ResponseKind::No,
+            text: text.into(),
+        }
     }
 
     pub fn bad(tag: &str, text: impl Into<String>) -> Self {
-        Self { tag: tag.to_owned(), kind: ResponseKind::Bad, text: text.into() }
+        Self {
+            tag: tag.to_owned(),
+            kind: ResponseKind::Bad,
+            text: text.into(),
+        }
     }
 
     pub fn untagged(text: impl Into<String>) -> Self {
-        Self { tag: "*".to_owned(), kind: ResponseKind::Untagged, text: text.into() }
+        Self {
+            tag: "*".to_owned(),
+            kind: ResponseKind::Untagged,
+            text: text.into(),
+        }
     }
 
     pub fn bye(text: impl Into<String>) -> Self {
-        Self { tag: "*".to_owned(), kind: ResponseKind::Bye, text: text.into() }
+        Self {
+            tag: "*".to_owned(),
+            kind: ResponseKind::Bye,
+            text: text.into(),
+        }
     }
 
     pub fn to_wire(&self) -> Vec<u8> {
         let kind_str = match self.kind {
-            ResponseKind::Ok      => "OK",
-            ResponseKind::No      => "NO",
-            ResponseKind::Bad     => "BAD",
+            ResponseKind::Ok => "OK",
+            ResponseKind::No => "NO",
+            ResponseKind::Bad => "BAD",
             ResponseKind::Preauth => "PREAUTH",
-            ResponseKind::Bye     => "BYE",
-            ResponseKind::Untagged => "" ,
+            ResponseKind::Bye => "BYE",
+            ResponseKind::Untagged => "",
         };
         let line = if matches!(self.kind, ResponseKind::Untagged) {
             format!("* {}\r\n", self.text)
@@ -56,7 +76,18 @@ impl Response {
         line.into_bytes()
     }
 
-    pub fn capability() -> Self {
-        Self::untagged("CAPABILITY IMAP4rev2 IMAP4rev1 LITERAL+ SASL-IR AUTH=PLAIN AUTH=LOGIN IDLE UIDPLUS")
+    pub fn capability_tokens(tls_active: bool) -> &'static str {
+        if tls_active {
+            "IMAP4rev2 IMAP4rev1 LITERAL+ SASL-IR AUTH=PLAIN AUTH=LOGIN IDLE UIDPLUS"
+        } else {
+            "IMAP4rev2 IMAP4rev1 STARTTLS LOGINDISABLED IDLE"
+        }
+    }
+
+    pub fn capability(tls_active: bool) -> Self {
+        Self::untagged(format!(
+            "CAPABILITY {}",
+            Self::capability_tokens(tls_active)
+        ))
     }
 }

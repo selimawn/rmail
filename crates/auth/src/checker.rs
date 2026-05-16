@@ -3,21 +3,17 @@
 //! Wraps `mail-auth` (stalwartlabs) which does the heavy lifting.
 //! We are responsible for feeding it the right data and interpreting the result.
 
-use std::net::IpAddr;
-use std::time::SystemTime;
 use mail_auth::{
-    AuthenticatedMessage, Resolver as MailAuthResolver,
-    DkimResult, SpfResult, DmarcResult, DmarcPolicy,
-    spf::verify::SpfOutput,
-    dmarc::verify::DmarcOutput,
+    dmarc::Policy, AuthenticatedMessage, DkimResult, DmarcResult, Resolver as MailAuthResolver,
+    SpfResult,
 };
-use tracing::{debug, info, warn};
-use thiserror::Error;
+use std::net::IpAddr;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub struct AuthResults {
-    pub spf:   SpfOutcome,
-    pub dkim:  DkimOutcome,
+    pub spf: SpfOutcome,
+    pub dkim: DkimOutcome,
     pub dmarc: DmarcOutcome,
 }
 
@@ -45,30 +41,46 @@ impl AuthResults {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SpfOutcome { Pass, Fail, SoftFail, Neutral, None, TempError, PermError }
+pub enum SpfOutcome {
+    Pass,
+    Fail,
+    SoftFail,
+    Neutral,
+    None,
+    TempError,
+    PermError,
+}
 impl SpfOutcome {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Pass      => "pass",
-            Self::Fail      => "fail",
-            Self::SoftFail  => "softfail",
-            Self::Neutral   => "neutral",
-            Self::None      => "none",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::SoftFail => "softfail",
+            Self::Neutral => "neutral",
+            Self::None => "none",
             Self::TempError => "temperror",
             Self::PermError => "permerror",
         }
     }
-    pub fn domain(&self) -> &str { "" }  // filled by caller
+    pub fn domain(&self) -> &str {
+        ""
+    } // filled by caller
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum DkimOutcome { Pass, Fail, None, PermError, TempError }
+pub enum DkimOutcome {
+    Pass,
+    Fail,
+    None,
+    PermError,
+    TempError,
+}
 impl DkimOutcome {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Pass      => "pass",
-            Self::Fail      => "fail",
-            Self::None      => "none",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::None => "none",
             Self::PermError => "permerror",
             Self::TempError => "temperror",
         }
@@ -76,15 +88,21 @@ impl DkimOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum DmarcOutcome { Pass, Fail, Quarantine, Reject, None }
+pub enum DmarcOutcome {
+    Pass,
+    Fail,
+    Quarantine,
+    Reject,
+    None,
+}
 impl DmarcOutcome {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Pass       => "pass",
-            Self::Fail       => "fail",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
             Self::Quarantine => "quarantine",
-            Self::Reject     => "reject",
-            Self::None       => "none",
+            Self::Reject => "reject",
+            Self::None => "none",
         }
     }
 }
@@ -106,13 +124,13 @@ pub async fn verify(
     // Cloudflare-only resolver. For now we use mail-auth's built-in resolver
     // and will wire our custom hickory resolver in the next phase.
     // TODO: replace with rmail-dns::Resolver once mail-auth supports custom resolvers.
-    let resolver = match MailAuthResolver::new_cloudflare_tls().await {
-        Ok(r)  => r,
+    let resolver = match MailAuthResolver::new_cloudflare_tls() {
+        Ok(r) => r,
         Err(e) => {
             warn!("Cannot build mail-auth resolver: {}", e);
             return AuthResults {
-                spf:   SpfOutcome::TempError,
-                dkim:  DkimOutcome::TempError,
+                spf: SpfOutcome::TempError,
+                dkim: DkimOutcome::TempError,
                 dmarc: DmarcOutcome::None,
             };
         }
@@ -120,15 +138,15 @@ pub async fn verify(
 
     // ─── SPF
     let spf = resolver
-        .verify_spf_helo(client_ip, helo_domain, server_hostname)
+        .verify_spf(client_ip, helo_domain, server_hostname, mail_from)
         .await;
 
     let spf_outcome = match spf.result() {
-        SpfResult::Pass      => SpfOutcome::Pass,
-        SpfResult::Fail      => SpfOutcome::Fail,
-        SpfResult::SoftFail  => SpfOutcome::SoftFail,
-        SpfResult::Neutral   => SpfOutcome::Neutral,
-        SpfResult::None      => SpfOutcome::None,
+        SpfResult::Pass => SpfOutcome::Pass,
+        SpfResult::Fail => SpfOutcome::Fail,
+        SpfResult::SoftFail => SpfOutcome::SoftFail,
+        SpfResult::Neutral => SpfOutcome::Neutral,
+        SpfResult::None => SpfOutcome::None,
         SpfResult::TempError => SpfOutcome::TempError,
         SpfResult::PermError => SpfOutcome::PermError,
     };
@@ -158,18 +176,36 @@ pub async fn verify(
 
     // ─── DMARC
     let dmarc_output = resolver
-        .verify_dmarc(&auth_msg, &dkim_results, mail_from_domain, &spf, &spf)
+        .verify_dmarc(
+            &auth_msg,
+            &dkim_results,
+            mail_from_domain,
+            &spf,
+            identity_domain_suffix,
+        )
         .await;
 
-    let dmarc_outcome = match dmarc_output.policy() {
-        DmarcPolicy::None       => match dmarc_output.dmarc_result() {
-            DmarcResult::Pass => DmarcOutcome::Pass,
-            _                 => DmarcOutcome::Fail,
-        },
-        DmarcPolicy::Quarantine => DmarcOutcome::Quarantine,
-        DmarcPolicy::Reject     => DmarcOutcome::Reject,
+    let dmarc_pass = matches!(dmarc_output.spf_result(), DmarcResult::Pass)
+        || matches!(dmarc_output.dkim_result(), DmarcResult::Pass);
+    let dmarc_outcome = if dmarc_pass {
+        DmarcOutcome::Pass
+    } else {
+        match dmarc_output.policy() {
+            Policy::Reject => DmarcOutcome::Reject,
+            Policy::Quarantine => DmarcOutcome::Quarantine,
+            Policy::None => DmarcOutcome::Fail,
+            Policy::Unspecified => DmarcOutcome::None,
+        }
     };
     debug!(dmarc = dmarc_outcome.label(), "DMARC result");
 
-    AuthResults { spf: spf_outcome, dkim: dkim_outcome, dmarc: dmarc_outcome }
+    AuthResults {
+        spf: spf_outcome,
+        dkim: dkim_outcome,
+        dmarc: dmarc_outcome,
+    }
+}
+
+fn identity_domain_suffix(domain: &str) -> &str {
+    domain
 }

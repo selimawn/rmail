@@ -26,12 +26,12 @@
 //! files (a partial transition) are deleted, envelopes without a body are
 //! quarantined into `corrupt/`.
 
+use rmail_core::{Envelope, Message, QueueState};
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
-use thiserror::Error;
-use rmail_core::{Envelope, Message, QueueState};
 
 #[derive(Debug, Error)]
 pub enum QueueError {
@@ -78,11 +78,7 @@ impl Queue {
     /// Accept a message into `incoming/`.
     /// Body first, envelope second, then directory fsync. After this returns
     /// Ok the message is durable: a kernel crash cannot lose it.
-    pub async fn enqueue(
-        &self,
-        envelope: Envelope,
-        body: &[u8],
-    ) -> Result<String, QueueError> {
+    pub async fn enqueue(&self, envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
         let id = envelope.id.to_string();
         debug!(%id, bytes = body.len(), "enqueue");
         let incoming = self.dir(QueueState::Incoming);
@@ -145,7 +141,11 @@ impl Queue {
         let env_bytes = fs::read(&env_path).await?;
         let envelope: Envelope = bincode::deserialize(&env_bytes)?;
         let size = fs::metadata(&eml_path).await?.len();
-        Ok(Message { envelope, body_path: eml_path, size })
+        Ok(Message {
+            envelope,
+            body_path: eml_path,
+            size,
+        })
     }
 
     // ─── Update envelope ─────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ impl Queue {
     ) -> Result<(), QueueError> {
         let id = envelope.id.to_string();
         let path = self.env_path(state, &id);
-        let tmp  = path.with_extension("tmp");
+        let tmp = path.with_extension("tmp");
         let bytes = bincode::serialize(envelope)?;
         let mut f = fs::File::create(&tmp).await?;
         f.write_all(&bytes).await?;
@@ -210,13 +210,12 @@ impl Queue {
     /// crash. Call **once** at startup before any other queue activity.
     ///
     /// Two cases handled:
-    ///   1. `.eml` without matching `.env` in the same dir
-    ///      → orphan body left by a partial `transition`. The envelope (the
-    ///        source of truth) is still in the source dir and will be picked
-    ///        up on the next pass. The orphan body is deleted.
-    ///   2. `.env` without matching `.eml` in the same dir
-    ///      → envelope claims a message we cannot find. Quarantine it into
-    ///        `corrupt/` for human inspection.
+    ///
+    /// - `.eml` without matching `.env`: orphan body left by a partial
+    ///   `transition`. The envelope is still in the source dir and will be
+    ///   picked up on the next pass. The orphan body is deleted.
+    /// - `.env` without matching `.eml`: envelope claims a message we cannot
+    ///   find. Quarantine it into `corrupt/` for human inspection.
     pub async fn recover(&self) -> Result<RecoveryReport, QueueError> {
         let mut report = RecoveryReport::default();
 
@@ -261,7 +260,8 @@ impl Queue {
                     let _ = fs::rename(
                         self.env_path(state, id),
                         self.env_path(QueueState::Corrupt, id),
-                    ).await;
+                    )
+                    .await;
                     report.corrupt_envelopes += 1;
                 }
             }

@@ -51,7 +51,7 @@ pub enum ParseError {
 
 /// Parse a single SMTP command line (without the trailing CRLF).
 pub fn parse(line: &str) -> Result<Command, ParseError> {
-    let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
+    let line = line.trim_end_matches(['\r', '\n']);
     let res: IResult<&str, Command> = alt((
         parse_ehlo,
         parse_helo,
@@ -94,13 +94,19 @@ fn parse_helo(i: &str) -> IResult<&str, Command> {
 
 fn parse_mail_from(i: &str) -> IResult<&str, Command> {
     // MAIL FROM:<addr> [SIZE=nnn]
-    let (i, _)    = tag_no_case("MAIL")(i)?;
-    let (i, _)    = space1(i)?;
-    let (i, _)    = tag_no_case("FROM:")(i)?;
+    let (i, _) = tag_no_case("MAIL")(i)?;
+    let (i, _) = space1(i)?;
+    let (i, _) = tag_no_case("FROM:")(i)?;
     let (i, addr) = take_while(|c: char| c != ' ' && c != '\r' && c != '\n')(i)?;
-    let (i, _)    = space0(i)?;
+    let (i, _) = space0(i)?;
     let (i, size) = opt(parse_size_param)(i)?;
-    Ok((i, Command::MailFrom { address: addr.to_owned(), size }))
+    Ok((
+        i,
+        Command::MailFrom {
+            address: addr.to_owned(),
+            size,
+        },
+    ))
 }
 
 fn parse_size_param(i: &str) -> IResult<&str, u64> {
@@ -110,9 +116,9 @@ fn parse_size_param(i: &str) -> IResult<&str, u64> {
 }
 
 fn parse_rcpt_to(i: &str) -> IResult<&str, Command> {
-    let (i, _)    = tag_no_case("RCPT")(i)?;
-    let (i, _)    = space1(i)?;
-    let (i, _)    = tag_no_case("TO:")(i)?;
+    let (i, _) = tag_no_case("RCPT")(i)?;
+    let (i, _) = space1(i)?;
+    let (i, _) = tag_no_case("TO:")(i)?;
     let (i, addr) = take_while(|c: char| c != ' ' && c != '\r' && c != '\n')(i)?;
     Ok((i, Command::RcptTo(addr.to_owned())))
 }
@@ -138,16 +144,19 @@ fn parse_starttls(i: &str) -> IResult<&str, Command> {
 }
 
 fn parse_auth(i: &str) -> IResult<&str, Command> {
-    let (i, _)       = tag_no_case("AUTH")(i)?;
-    let (i, _)       = space1(i)?;
-    let (i, mech)    = word(i)?;
-    let (i, _)       = space0(i)?;
+    let (i, _) = tag_no_case("AUTH")(i)?;
+    let (i, _) = space1(i)?;
+    let (i, mech) = word(i)?;
+    let (i, _) = space0(i)?;
     let (i, initial) = opt(map(rest, |s: &str| s.to_owned()))(i)?;
     let initial = initial.filter(|s| !s.is_empty());
     match mech.to_uppercase().as_str() {
         "PLAIN" => Ok((i, Command::AuthPlain(initial))),
         "LOGIN" => Ok((i, Command::AuthLogin)),
-        _       => Err(nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Tag))),
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Tag,
+        ))),
     }
 }
 
@@ -166,19 +175,34 @@ mod tests {
 
     #[test]
     fn ehlo() {
-        assert_eq!(parse("EHLO mail.google.com").unwrap(), Command::Ehlo("mail.google.com".into()));
+        assert_eq!(
+            parse("EHLO mail.google.com").unwrap(),
+            Command::Ehlo("mail.google.com".into())
+        );
     }
 
     #[test]
     fn mail_from_with_size() {
         let cmd = parse("MAIL FROM:<bob@gmail.com> SIZE=4521").unwrap();
-        assert_eq!(cmd, Command::MailFrom { address: "<bob@gmail.com>".into(), size: Some(4521) });
+        assert_eq!(
+            cmd,
+            Command::MailFrom {
+                address: "<bob@gmail.com>".into(),
+                size: Some(4521)
+            }
+        );
     }
 
     #[test]
     fn mail_from_null() {
         let cmd = parse("MAIL FROM:<>").unwrap();
-        assert_eq!(cmd, Command::MailFrom { address: "<>".into(), size: None });
+        assert_eq!(
+            cmd,
+            Command::MailFrom {
+                address: "<>".into(),
+                size: None
+            }
+        );
     }
 
     #[test]
@@ -195,6 +219,9 @@ mod tests {
     #[test]
     fn case_insensitive() {
         assert_eq!(parse("quit").unwrap(), Command::Quit);
-        assert_eq!(parse("Ehlo mx.example.org").unwrap(), Command::Ehlo("mx.example.org".into()));
+        assert_eq!(
+            parse("Ehlo mx.example.org").unwrap(),
+            Command::Ehlo("mx.example.org".into())
+        );
     }
 }

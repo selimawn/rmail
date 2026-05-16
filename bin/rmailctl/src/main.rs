@@ -4,10 +4,10 @@
 //! They operate directly on the filesystem (queue dirs, mailbox dirs)
 //! — no Unix socket needed for the initial release.
 
-use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rmail_config::Config;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "rmailctl", about = "rmail admin CLI")]
@@ -91,9 +91,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Domain(sub) => handle_domain(sub, &config).await?,
-        Cmd::User(sub)   => handle_user(sub, &config).await?,
-        Cmd::Queue(sub)  => handle_queue(sub, &config).await?,
-        Cmd::Status      => handle_status(&config),
+        Cmd::User(sub) => handle_user(sub, &config).await?,
+        Cmd::Queue(sub) => handle_queue(sub, &config).await?,
+        Cmd::Status => handle_status(&config),
     }
     Ok(())
 }
@@ -125,17 +125,23 @@ async fn handle_domain(cmd: DomainCmd, config: &Config) -> Result<()> {
             }
         }
         DomainCmd::Dns { name, export } => {
-            let domain = config.find_domain(&name)
+            let domain = config
+                .find_domain(&name)
                 .context(format!("domain {} not found in config", name))?;
             let server_ip = "<YOUR_SERVER_IP>";
             match export.as_deref() {
-                Some("cloudflare") => print_cloudflare_json(&name, server_ip, &domain.dkim_selector),
-                Some("bind")       => print_bind_zone(&name, server_ip, &domain.dkim_selector),
-                _                  => print_dns_records(&name, server_ip, &domain.dkim_selector),
+                Some("cloudflare") => {
+                    print_cloudflare_json(&name, server_ip, &domain.dkim_selector)
+                }
+                Some("bind") => print_bind_zone(&name, server_ip, &domain.dkim_selector),
+                _ => print_dns_records(&name, server_ip, &domain.dkim_selector),
             }
         }
         DomainCmd::Remove { name } => {
-            println!("Remove the [[domain]] block for {} from rmail.toml manually.", name);
+            println!(
+                "Remove the [[domain]] block for {} from rmail.toml manually.",
+                name
+            );
             println!("(Config file editing is not yet automated.)");
         }
     }
@@ -149,7 +155,9 @@ fn print_dns_records(domain: &str, ip: &str, selector: &str) {
     println!("  MX      {domain}                   10 mail.{domain}.");
     println!("  TXT     {domain}                   v=spf1 mx -all");
     println!("  TXT     {selector}._domainkey.{domain}  v=DKIM1; k=rsa; p=<YOUR_DKIM_PUBLIC_KEY>");
-    println!("  TXT     _dmarc.{domain}            v=DMARC1; p=quarantine; rua=mailto:dmarc@{domain}");
+    println!(
+        "  TXT     _dmarc.{domain}            v=DMARC1; p=quarantine; rua=mailto:dmarc@{domain}"
+    );
     println!("  TXT     _mta-sts.{domain}          v=STSv1; id=20260426");
     println!("  TXT     _smtp._tls.{domain}        v=TLSRPTv1; rua=mailto:tlsrpt@{domain}");
     println!();
@@ -176,9 +184,15 @@ fn print_bind_zone(domain: &str, ip: &str, selector: &str) {
     println!("@         3600  IN  MX    10 mail.{}.", domain);
     println!("@         3600  IN  TXT   \"v=spf1 mx -all\"");
     println!("{selector}._domainkey  3600  IN  TXT  \"v=DKIM1; k=rsa; p=<YOUR_DKIM_PUBLIC_KEY>\"");
-    println!("_dmarc    3600  IN  TXT   \"v=DMARC1; p=quarantine; rua=mailto:dmarc@{}\"", domain);
+    println!(
+        "_dmarc    3600  IN  TXT   \"v=DMARC1; p=quarantine; rua=mailto:dmarc@{}\"",
+        domain
+    );
     println!("_mta-sts  3600  IN  TXT   \"v=STSv1; id=20260426\"");
-    println!("_smtp._tls 3600 IN  TXT   \"v=TLSRPTv1; rua=mailto:tlsrpt@{}\"", domain);
+    println!(
+        "_smtp._tls 3600 IN  TXT   \"v=TLSRPTv1; rua=mailto:tlsrpt@{}\"",
+        domain
+    );
 }
 
 // ─── user ─────────────────────────────────────────────────────────────────
@@ -189,7 +203,9 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
             if config.users.is_empty() {
                 println!("No users configured.");
             } else {
-                for u in &config.users { println!("{}", u.address); }
+                for u in &config.users {
+                    println!("{}", u.address);
+                }
             }
         }
         UserCmd::Add { address } => {
@@ -202,7 +218,8 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
             println!("password_hash = \"{}\"", hash);
         }
         UserCmd::Passwd { address } => {
-            config.find_user(&address)
+            config
+                .find_user(&address)
                 .context(format!("user {} not found", address))?;
             let password = prompt_password("New password: ")?;
             let hash = rmail_auth::password::hash(&password)?;
@@ -210,7 +227,10 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
             println!("  password_hash = \"{}\"", hash);
         }
         UserCmd::Remove { address } => {
-            println!("Remove the [[user]] block for {} from rmail.toml manually.", address);
+            println!(
+                "Remove the [[user]] block for {} from rmail.toml manually.",
+                address
+            );
         }
     }
     Ok(())
@@ -228,18 +248,31 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
                 println!("Queue {} is empty.", state);
             } else {
                 println!("{} message(s) in {}:", ids.len(), state);
-                for id in ids { println!("  {}", id); }
+                for id in ids {
+                    println!("  {}", id);
+                }
             }
         }
         QueueCmd::Show { id } => {
             // Try active first, then deferred
-            for state in [rmail_core::QueueState::Active, rmail_core::QueueState::Deferred,
-                          rmail_core::QueueState::Hold, rmail_core::QueueState::Incoming] {
+            for state in [
+                rmail_core::QueueState::Active,
+                rmail_core::QueueState::Deferred,
+                rmail_core::QueueState::Hold,
+                rmail_core::QueueState::Incoming,
+            ] {
                 if let Ok(msg) = queue.load(state, &id).await {
                     let env = &msg.envelope;
                     println!("ID:       {}", env.id);
                     println!("From:     {}", env.from);
-                    println!("To:       {}", env.recipients.iter().map(|r| r.address.to_string()).collect::<Vec<_>>().join(", "));
+                    println!(
+                        "To:       {}",
+                        env.recipients
+                            .iter()
+                            .map(|r| r.address.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                     println!("Received: {}", env.received_at);
                     println!("Client:   {} ({})", env.client_helo, env.client_ip);
                     println!("Retries:  {}", env.retry_count);
@@ -253,13 +286,23 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
             let ids = queue.list(rmail_core::QueueState::Deferred).await?;
             let n = ids.len();
             for id in ids {
-                queue.transition(&id, rmail_core::QueueState::Deferred, rmail_core::QueueState::Active).await?;
+                queue
+                    .transition(
+                        &id,
+                        rmail_core::QueueState::Deferred,
+                        rmail_core::QueueState::Active,
+                    )
+                    .await?;
             }
             println!("Flushed {} message(s) from deferred to active.", n);
         }
         QueueCmd::Delete { id } => {
-            for state in [rmail_core::QueueState::Active, rmail_core::QueueState::Deferred,
-                          rmail_core::QueueState::Hold, rmail_core::QueueState::Incoming] {
+            for state in [
+                rmail_core::QueueState::Active,
+                rmail_core::QueueState::Deferred,
+                rmail_core::QueueState::Hold,
+                rmail_core::QueueState::Incoming,
+            ] {
                 if queue.load(state, &id).await.is_ok() {
                     queue.remove(state, &id).await?;
                     println!("Deleted {}", id);
@@ -269,11 +312,23 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
             println!("Message {} not found.", id);
         }
         QueueCmd::Hold { id } => {
-            queue.transition(&id, rmail_core::QueueState::Active, rmail_core::QueueState::Hold).await?;
+            queue
+                .transition(
+                    &id,
+                    rmail_core::QueueState::Active,
+                    rmail_core::QueueState::Hold,
+                )
+                .await?;
             println!("Message {} put on hold.", id);
         }
         QueueCmd::Release { id } => {
-            queue.transition(&id, rmail_core::QueueState::Hold, rmail_core::QueueState::Active).await?;
+            queue
+                .transition(
+                    &id,
+                    rmail_core::QueueState::Hold,
+                    rmail_core::QueueState::Active,
+                )
+                .await?;
             println!("Message {} released.", id);
         }
     }
@@ -284,9 +339,35 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
 
 fn handle_status(config: &Config) {
     println!("hostname:   {}", config.server.hostname);
-    println!("smtp:       {}", config.server.listen_smtp.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-    println!("imap:       {}", config.server.listen_imap.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-    println!("domains:    {}", config.domains.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
+    println!(
+        "smtp:       {}",
+        config
+            .server
+            .listen_smtp
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "imap:       {}",
+        config
+            .server
+            .listen_imap
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "domains:    {}",
+        config
+            .domains
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("users:      {}", config.users.len());
     println!("queue dir:  {}", config.storage.queue_dir.display());
     println!("mailbox dir:{}", config.storage.mailbox_dir.display());
@@ -297,11 +378,11 @@ fn handle_status(config: &Config) {
 fn parse_queue_state(s: &str) -> Result<rmail_core::QueueState> {
     match s {
         "incoming" => Ok(rmail_core::QueueState::Incoming),
-        "active"   => Ok(rmail_core::QueueState::Active),
+        "active" => Ok(rmail_core::QueueState::Active),
         "deferred" => Ok(rmail_core::QueueState::Deferred),
-        "hold"     => Ok(rmail_core::QueueState::Hold),
-        "bounce"   => Ok(rmail_core::QueueState::Bounce),
-        "corrupt"  => Ok(rmail_core::QueueState::Corrupt),
+        "hold" => Ok(rmail_core::QueueState::Hold),
+        "bounce" => Ok(rmail_core::QueueState::Bounce),
+        "corrupt" => Ok(rmail_core::QueueState::Corrupt),
         _ => anyhow::bail!("unknown queue state: {}", s),
     }
 }

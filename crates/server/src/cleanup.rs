@@ -9,7 +9,8 @@ use rmail_core::Envelope;
 /// Prepend a `Received:` header to raw message bytes.
 /// This is the trace record required by RFC 5321 §3.7.2.
 pub fn add_received_header(body: &[u8], envelope: &Envelope, our_hostname: &str) -> Vec<u8> {
-    let ts = envelope.received_at
+    let ts = envelope
+        .received_at
         .format(&time::format_description::well_known::Rfc2822)
         .unwrap_or_else(|_| "unknown".to_owned());
 
@@ -20,7 +21,9 @@ pub fn add_received_header(body: &[u8], envelope: &Envelope, our_hostname: &str)
         envelope.client_ip,
         our_hostname,
         envelope.id,
-        envelope.recipients.first()
+        envelope
+            .recipients
+            .first()
             .map(|r| r.address.to_string())
             .unwrap_or_else(|| "unknown".into()),
         ts,

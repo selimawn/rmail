@@ -1,13 +1,13 @@
 //! Outbound SMTP client — used by the delivery worker.
 //! Handles STARTTLS, SIZE, and basic ESMTP negotiation.
 
+use rmail_core::{Address, Envelope};
+use rmail_tls::{TlsConnector, TlsMode};
 use std::net::SocketAddr;
+use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
-use thiserror::Error;
-use rmail_core::Envelope;
-use rmail_tls::TlsConnector;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -21,16 +21,29 @@ pub enum ClientError {
     Tls(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeliveryResult {
     pub code: u16,
     pub message: String,
 }
 
 impl DeliveryResult {
-    pub fn is_success(&self)   -> bool { self.code / 100 == 2 }
-    pub fn is_transient(&self) -> bool { self.code / 100 == 4 }
-    pub fn is_permanent(&self) -> bool { self.code / 100 == 5 }
+    pub fn is_success(&self) -> bool {
+        self.code / 100 == 2
+    }
+    pub fn is_transient(&self) -> bool {
+        self.code / 100 == 4
+    }
+    pub fn is_permanent(&self) -> bool {
+        self.code / 100 == 5
+    }
+}
+
+#[derive(Debug)]
+pub struct DeliveryOutcome {
+    pub accepted: Vec<Address>,
+    pub rejected: Vec<(Address, DeliveryResult)>,
+    pub final_result: DeliveryResult,
 }
 
 /// Deliver a single message to a remote MTA.
@@ -38,10 +51,11 @@ impl DeliveryResult {
 pub async fn deliver(
     target: SocketAddr,
     envelope: &Envelope,
+    recipients: &[Address],
     body: &[u8],
     our_hostname: &str,
     remote_domain: &str,
-) -> Result<DeliveryResult, ClientError> {
+) -> Result<DeliveryOutcome, ClientError> {
     debug!(%target, id = %envelope.id, "connecting");
     let stream = TcpStream::connect(target).await?;
     let mut io = BufReader::new(stream);
@@ -49,37 +63,55 @@ pub async fn deliver(
     // Banner
     let banner = read_reply(&mut io).await?;
     if banner.code != 220 {
-        return Err(ClientError::Smtp { code: banner.code, message: banner.message });
+        return Err(ClientError::Smtp {
+            code: banner.code,
+            message: banner.message,
+        });
     }
 
     // EHLO
     let ehlo = send_recv(&mut io, &format!("EHLO {}\r\n", our_hostname)).await?;
     if ehlo.code != 250 {
-        return Err(ClientError::Smtp { code: ehlo.code, message: ehlo.message });
+        return Err(ClientError::Smtp {
+            code: ehlo.code,
+            message: ehlo.message,
+        });
     }
 
     // Check for STARTTLS capability in EHLO response
-    let has_starttls = ehlo.message
+    let has_starttls = ehlo
+        .message
         .lines()
         .any(|l| l.trim().eq_ignore_ascii_case("starttls"));
 
     if has_starttls {
         let r = send_recv(&mut io, "STARTTLS\r\n").await?;
         if r.code == 220 {
-            let connector = TlsConnector::new()
-                .map_err(|e| ClientError::Tls(e.to_string()))?;
+            let connector = TlsConnector::new();
             let plain = io.into_inner();
-            match connector.connect(remote_domain, plain).await {
-                Ok(tls_stream) => {
+            match connector
+                .connect(remote_domain, plain, TlsMode::Opportunistic)
+                .await
+            {
+                Ok(Some(tls_stream)) => {
                     debug!(%remote_domain, "STARTTLS established");
                     let mut tls_io = BufReader::new(tls_stream);
                     // Re-EHLO over TLS
-                    let ehlo2 = send_recv(&mut tls_io,
-                        &format!("EHLO {}\r\n", our_hostname)).await?;
+                    let ehlo2 =
+                        send_recv(&mut tls_io, &format!("EHLO {}\r\n", our_hostname)).await?;
                     if ehlo2.code != 250 {
-                        return Err(ClientError::Smtp { code: ehlo2.code, message: ehlo2.message });
+                        return Err(ClientError::Smtp {
+                            code: ehlo2.code,
+                            message: ehlo2.message,
+                        });
                     }
-                    return deliver_inner(&mut tls_io, envelope, body).await;
+                    return deliver_inner(&mut tls_io, envelope, recipients, body).await;
+                }
+                Ok(None) => {
+                    warn!(%remote_domain, "STARTTLS failed, falling back to plaintext");
+                    return Err(ClientError::Tls(
+                        "STARTTLS fallback requires reconnect".into(),
+                    ));
                 }
                 Err(e) => {
                     warn!(%remote_domain, "STARTTLS handshake failed: {}", e);
@@ -89,14 +121,15 @@ pub async fn deliver(
         }
     }
 
-    deliver_inner(&mut io, envelope, body).await
+    deliver_inner(&mut io, envelope, recipients, body).await
 }
 
 async fn deliver_inner<S>(
     io: &mut S,
     envelope: &Envelope,
+    recipients: &[Address],
     body: &[u8],
-) -> Result<DeliveryResult, ClientError>
+) -> Result<DeliveryOutcome, ClientError>
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
 {
@@ -104,22 +137,56 @@ where
     let r = send_recv(io, &format!("MAIL FROM:{}\r\n", envelope.from)).await?;
     if r.code != 250 {
         let _ = io.write_all(b"QUIT\r\n").await;
-        return Ok(r);
+        return Ok(DeliveryOutcome {
+            accepted: Vec::new(),
+            rejected: recipients
+                .iter()
+                .cloned()
+                .map(|addr| (addr, r.clone()))
+                .collect(),
+            final_result: r,
+        });
     }
 
     // RCPT TO
-    for rcpt in envelope.pending_recipients() {
-        let r = send_recv(io, &format!("RCPT TO:{}\r\n", rcpt.address)).await?;
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for rcpt in recipients {
+        let r = send_recv(io, &format!("RCPT TO:{}\r\n", rcpt)).await?;
         if !r.is_success() {
-            warn!(addr = %rcpt.address, code = r.code, "RCPT failed");
+            warn!(addr = %rcpt, code = r.code, "RCPT failed");
+            rejected.push((rcpt.clone(), r));
+        } else {
+            accepted.push(rcpt.clone());
         }
+    }
+
+    if accepted.is_empty() {
+        let final_result =
+            rejected
+                .first()
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| DeliveryResult {
+                    code: 554,
+                    message: "No valid recipients".into(),
+                });
+        let _ = io.write_all(b"QUIT\r\n").await;
+        return Ok(DeliveryOutcome {
+            accepted,
+            rejected,
+            final_result,
+        });
     }
 
     // DATA
     let r = send_recv(io, "DATA\r\n").await?;
     if r.code != 354 {
         let _ = io.write_all(b"QUIT\r\n").await;
-        return Ok(r);
+        return Ok(DeliveryOutcome {
+            accepted,
+            rejected,
+            final_result: r,
+        });
     }
 
     // Body with dot-stuffing
@@ -130,7 +197,11 @@ where
     let r = read_reply(io).await?;
     info!(id = %envelope.id, code = r.code, "delivery result");
     let _ = io.write_all(b"QUIT\r\n").await;
-    Ok(r)
+    Ok(DeliveryOutcome {
+        accepted,
+        rejected,
+        final_result: r,
+    })
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -143,14 +214,21 @@ async fn read_reply<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<DeliveryRes
             return Err(ClientError::Eof);
         }
         let trimmed = line.trim_end();
-        if trimmed.len() < 3 { return Err(ClientError::Eof); }
+        if trimmed.len() < 3 {
+            return Err(ClientError::Eof);
+        }
         let c: u16 = trimmed[..3].parse().map_err(|_| ClientError::Eof)?;
         let rest = if trimmed.len() > 4 { &trimmed[4..] } else { "" };
         full.push_str(rest);
-        if trimmed.len() < 4 || &trimmed[3..4] == " " { break c; }
+        if trimmed.len() < 4 || &trimmed[3..4] == " " {
+            break c;
+        }
         full.push('\n');
     };
-    Ok(DeliveryResult { code, message: full })
+    Ok(DeliveryResult {
+        code,
+        message: full,
+    })
 }
 
 async fn send_recv<S: AsyncBufRead + AsyncWrite + Unpin>(
@@ -165,7 +243,9 @@ fn dot_stuff(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 16);
     let mut bol = true;
     for &b in body {
-        if bol && b == b'.' { out.push(b'.'); }
+        if bol && b == b'.' {
+            out.push(b'.');
+        }
         out.push(b);
         bol = b == b'\n';
     }
@@ -176,9 +256,15 @@ fn dot_stuff(body: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     #[test]
-    fn dot_stuff_normal()      { assert_eq!(dot_stuff(b"hello\r\nworld"), b"hello\r\nworld"); }
+    fn dot_stuff_normal() {
+        assert_eq!(dot_stuff(b"hello\r\nworld"), b"hello\r\nworld");
+    }
     #[test]
-    fn dot_stuff_leading_dot() { assert_eq!(dot_stuff(b".leading"), b"..leading"); }
+    fn dot_stuff_leading_dot() {
+        assert_eq!(dot_stuff(b".leading"), b"..leading");
+    }
     #[test]
-    fn dot_stuff_mid_line_dot(){ assert_eq!(dot_stuff(b"hel.lo"), b"hel.lo"); }
+    fn dot_stuff_mid_line_dot() {
+        assert_eq!(dot_stuff(b"hel.lo"), b"hel.lo");
+    }
 }

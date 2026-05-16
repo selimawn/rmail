@@ -3,16 +3,16 @@
 //! Starts all listeners (SMTP + IMAP) and the queue manager.
 //! All components share Arc references to config, queue, maildir, and resolver.
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
 use rmail_config::Config;
-use rmail_queue::Queue;
-use rmail_mailbox::Maildir;
 use rmail_dns::Resolver;
+use rmail_mailbox::Maildir;
+use rmail_queue::Queue;
 use rmail_tls::TlsAcceptor;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "rmail", about = "rmail SMTP/IMAP server")]
@@ -26,8 +26,9 @@ async fn main() -> Result<()> {
     // Tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rmail=info,rmail_server=info,rmail_smtp=info,rmail_imap=info".into())
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "rmail=info,rmail_server=info,rmail_smtp=info,rmail_imap=info".into()
+            }),
         )
         .init();
 
@@ -40,12 +41,18 @@ async fn main() -> Result<()> {
     info!(hostname = %config.server.hostname, "rmail starting");
 
     // Shared state
-    let queue   = Arc::new(Queue::new(config.storage.queue_dir.clone()).await
-        .context("failed to initialise queue directory")?);
+    let queue = Arc::new(
+        Queue::new(config.storage.queue_dir.clone())
+            .await
+            .context("failed to initialise queue directory")?,
+    );
+    queue.recover().await.context("failed to recover queue")?;
     let maildir = Arc::new(Maildir::new(config.storage.mailbox_dir.clone()));
     let resolver = Arc::new(Resolver::new(config.dns.dnssec));
-    let tls = Arc::new(TlsAcceptor::from_pem(&config.tls.cert, &config.tls.key)
-        .context("failed to load TLS certificate")?);
+    let tls = Arc::new(
+        TlsAcceptor::from_pem(&config.tls.cert, &config.tls.key)
+            .context("failed to load TLS certificate")?,
+    );
 
     info!("shared state initialised");
 
@@ -53,23 +60,21 @@ async fn main() -> Result<()> {
     let smtp_task = {
         let (config, queue, tls) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&tls));
         tokio::spawn(async move {
-            rmail_server::smtp_listener::run(
-                config.server.listen_smtp.clone(),
-                config,
-                queue,
-                tls,
-            ).await
+            rmail_server::smtp_listener::run(config.server.listen_smtp.clone(), config, queue, tls)
+                .await
         })
     };
 
     let imap_task = {
-        let (config, maildir) = (Arc::clone(&config), Arc::clone(&maildir));
+        let (config, maildir, tls) = (Arc::clone(&config), Arc::clone(&maildir), Arc::clone(&tls));
         tokio::spawn(async move {
             rmail_server::imap_listener::run(
                 config.server.listen_imap.clone(),
                 config,
                 maildir,
-            ).await
+                tls,
+            )
+            .await
         })
     };
 

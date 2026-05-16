@@ -10,6 +10,8 @@ pub enum Command {
     Noop,
     /// `tag LOGOUT`
     Logout,
+    /// `tag STARTTLS`
+    StartTls,
     /// `tag LOGIN user password` (plain-text, TLS required)
     Login { username: String, password: String },
     /// `tag SELECT mailbox`
@@ -19,19 +21,36 @@ pub enum Command {
     /// `tag LIST ref pattern`
     List { reference: String, pattern: String },
     /// `tag STATUS mailbox (items...)`
-    Status { mailbox: String, items: Vec<StatusItem> },
+    Status {
+        mailbox: String,
+        items: Vec<StatusItem>,
+    },
     /// `tag FETCH seq-set (items...)`
-    Fetch { sequence: String, items: Vec<FetchItem> },
+    Fetch {
+        sequence: String,
+        items: Vec<FetchItem>,
+    },
     /// `tag STORE seq-set flags`
-    Store { sequence: String, flags: Vec<String>, silent: bool },
+    Store {
+        sequence: String,
+        flags: Vec<String>,
+        silent: bool,
+    },
     /// `tag EXPUNGE`
     Expunge,
     /// `tag APPEND mailbox (\flags) message`
     Append { mailbox: String },
     /// `tag UID FETCH ...`
-    UidFetch { sequence: String, items: Vec<FetchItem> },
+    UidFetch {
+        sequence: String,
+        items: Vec<FetchItem>,
+    },
     /// `tag UID STORE ...`
-    UidStore { sequence: String, flags: Vec<String>, silent: bool },
+    UidStore {
+        sequence: String,
+        flags: Vec<String>,
+        silent: bool,
+    },
     /// `tag UID EXPUNGE sequence`
     UidExpunge(String),
     /// `tag SEARCH criteria`
@@ -88,7 +107,7 @@ pub enum ParseError {
 /// Parse a single IMAP command line (without CRLF).
 /// Returns `(tag, Command)`.
 pub fn parse(line: &str) -> Result<(String, Command), ParseError> {
-    let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
+    let line = line.trim_end_matches(['\r', '\n']);
     let mut parts = line.splitn(3, ' ');
     let tag = parts.next().ok_or(ParseError::Malformed)?.to_owned();
     let verb = parts.next().ok_or(ParseError::Malformed)?.to_uppercase();
@@ -96,40 +115,53 @@ pub fn parse(line: &str) -> Result<(String, Command), ParseError> {
 
     let cmd = match verb.as_str() {
         "CAPABILITY" => Command::Capability,
-        "NOOP"       => Command::Noop,
-        "LOGOUT"     => Command::Logout,
-        "LOGIN"      => {
+        "NOOP" => Command::Noop,
+        "LOGOUT" => Command::Logout,
+        "STARTTLS" => Command::StartTls,
+        "LOGIN" => {
             let (user, pass) = parse_login_args(rest)?;
-            Command::Login { username: user, password: pass }
+            Command::Login {
+                username: user,
+                password: pass,
+            }
         }
-        "SELECT"     => Command::Select(unquote(rest)),
-        "EXAMINE"    => Command::Examine(unquote(rest)),
-        "LIST"       => {
+        "SELECT" => Command::Select(unquote(rest)),
+        "EXAMINE" => Command::Examine(unquote(rest)),
+        "LIST" => {
             let (reference, pattern) = parse_two_strings(rest)?;
             Command::List { reference, pattern }
         }
-        "STATUS"     => {
+        "STATUS" => {
             let (mailbox, items) = parse_status_args(rest)?;
             Command::Status { mailbox, items }
         }
-        "FETCH"      => {
+        "FETCH" => {
             let (seq, items) = parse_fetch_args(rest)?;
-            Command::Fetch { sequence: seq, items }
+            Command::Fetch {
+                sequence: seq,
+                items,
+            }
         }
-        "STORE"      => {
+        "STORE" => {
             let (seq, flags, silent) = parse_store_args(rest)?;
-            Command::Store { sequence: seq, flags, silent }
+            Command::Store {
+                sequence: seq,
+                flags,
+                silent,
+            }
         }
-        "EXPUNGE"    => Command::Expunge,
-        "CLOSE"      => Command::Close,
-        "UNSELECT"   => Command::Unselect,
-        "IDLE"       => Command::Idle,
-        "DONE"       => Command::Done,
-        "UID"        => parse_uid_command(rest)?,
-        "SEARCH"     => Command::Search(rest.to_owned()),
-        "APPEND"     => {
-            let mailbox = rest.splitn(2, ' ').next().unwrap_or("");
-            Command::Append { mailbox: unquote(mailbox) }
+        "EXPUNGE" => Command::Expunge,
+        "CLOSE" => Command::Close,
+        "UNSELECT" => Command::Unselect,
+        "IDLE" => Command::Idle,
+        "DONE" => Command::Done,
+        "UID" => parse_uid_command(rest)?,
+        "SEARCH" => Command::Search(rest.to_owned()),
+        "APPEND" => {
+            let mailbox = rest.split(' ').next().unwrap_or("");
+            Command::Append {
+                mailbox: unquote(mailbox),
+            }
         }
         _ => return Err(ParseError::Unknown),
     };
@@ -139,13 +171,20 @@ pub fn parse(line: &str) -> Result<(String, Command), ParseError> {
 fn parse_uid_command(rest: &str) -> Result<Command, ParseError> {
     let mut parts = rest.splitn(3, ' ');
     let subcmd = parts.next().unwrap_or("").to_uppercase();
-    let seq    = parts.next().unwrap_or("").to_owned();
-    let args   = parts.next().unwrap_or("");
+    let seq = parts.next().unwrap_or("").to_owned();
+    let args = parts.next().unwrap_or("");
     match subcmd.as_str() {
-        "FETCH"   => Ok(Command::UidFetch { sequence: seq, items: parse_fetch_items(args) }),
-        "STORE"   => {
+        "FETCH" => Ok(Command::UidFetch {
+            sequence: seq,
+            items: parse_fetch_items(args),
+        }),
+        "STORE" => {
             let (_, flags, silent) = parse_store_args(&format!("{} {}", seq, args))?;
-            Ok(Command::UidStore { sequence: seq, flags, silent })
+            Ok(Command::UidStore {
+                sequence: seq,
+                flags,
+                silent,
+            })
         }
         "EXPUNGE" => Ok(Command::UidExpunge(seq)),
         _ => Err(ParseError::Unknown),
@@ -171,18 +210,21 @@ fn parse_status_args(rest: &str) -> Result<(String, Vec<StatusItem>), ParseError
     let paren = rest.find('(').ok_or(ParseError::Malformed)?;
     let mailbox = unquote(rest[..paren].trim());
     let items_str = &rest[paren + 1..rest.rfind(')').unwrap_or(rest.len())];
-    let items = items_str.split_whitespace().filter_map(parse_status_item).collect();
+    let items = items_str
+        .split_whitespace()
+        .filter_map(parse_status_item)
+        .collect();
     Ok((mailbox, items))
 }
 
 fn parse_status_item(s: &str) -> Option<StatusItem> {
     match s.to_uppercase().as_str() {
-        "MESSAGES"    => Some(StatusItem::Messages),
-        "RECENT"      => Some(StatusItem::Recent),
-        "UIDNEXT"     => Some(StatusItem::UidNext),
+        "MESSAGES" => Some(StatusItem::Messages),
+        "RECENT" => Some(StatusItem::Recent),
+        "UIDNEXT" => Some(StatusItem::UidNext),
         "UIDVALIDITY" => Some(StatusItem::UidValidity),
-        "UNSEEN"      => Some(StatusItem::Unseen),
-        _             => None,
+        "UNSEEN" => Some(StatusItem::Unseen),
+        _ => None,
     }
 }
 
@@ -195,23 +237,27 @@ fn parse_fetch_args(rest: &str) -> Result<(String, Vec<FetchItem>), ParseError> 
 
 fn parse_fetch_items(s: &str) -> Vec<FetchItem> {
     let s = s.trim_matches(|c| c == '(' || c == ')');
-    s.split_whitespace().filter_map(|tok| match tok.to_uppercase().as_str() {
-        "RFC822"          => Some(FetchItem::Rfc822),
-        "RFC822.HEADER"   => Some(FetchItem::Rfc822Header),
-        "RFC822.SIZE"     => Some(FetchItem::Rfc822Size),
-        "BODY[]"          => Some(FetchItem::Body),
-        "ENVELOPE"        => Some(FetchItem::Envelope),
-        "FLAGS"           => Some(FetchItem::Flags),
-        "UID"             => Some(FetchItem::Uid),
-        "INTERNALDATE"    => Some(FetchItem::InternalDate),
-        _ if tok.to_uppercase().starts_with("BODY.PEEK") => Some(FetchItem::BodyPeek(tok.to_owned())),
-        _                 => None,
-    }).collect()
+    s.split_whitespace()
+        .filter_map(|tok| match tok.to_uppercase().as_str() {
+            "RFC822" => Some(FetchItem::Rfc822),
+            "RFC822.HEADER" => Some(FetchItem::Rfc822Header),
+            "RFC822.SIZE" => Some(FetchItem::Rfc822Size),
+            "BODY[]" => Some(FetchItem::Body),
+            "ENVELOPE" => Some(FetchItem::Envelope),
+            "FLAGS" => Some(FetchItem::Flags),
+            "UID" => Some(FetchItem::Uid),
+            "INTERNALDATE" => Some(FetchItem::InternalDate),
+            _ if tok.to_uppercase().starts_with("BODY.PEEK") => {
+                Some(FetchItem::BodyPeek(tok.to_owned()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn parse_store_args(rest: &str) -> Result<(String, Vec<String>, bool), ParseError> {
     let mut parts = rest.splitn(3, ' ');
-    let seq    = parts.next().ok_or(ParseError::Malformed)?.to_owned();
+    let seq = parts.next().ok_or(ParseError::Malformed)?.to_owned();
     let action = parts.next().unwrap_or("").to_uppercase();
     let silent = action.ends_with(".SILENT");
     let flags_str = parts.next().unwrap_or("");

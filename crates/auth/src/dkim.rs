@@ -1,26 +1,32 @@
 //! DKIM verification (inbound) and signing (outbound).
 //! Uses `mail-auth` 0.5.
 
+use mail_auth::common::headers::HeaderWriter;
 use mail_auth::{
-    AuthenticatedMessage,
     common::crypto::{RsaKey, Sha256},
     dkim::DkimSigner,
+    AuthenticatedMessage,
 };
-use mail_auth::common::headers::HeaderWriter;
-use tracing::debug;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DkimVerdict { Pass, Fail, PermError, TempError, None }
+pub enum DkimVerdict {
+    Pass,
+    Fail,
+    PermError,
+    TempError,
+    None,
+}
 
 impl std::fmt::Display for DkimVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Pass      => "pass",
-            Self::Fail      => "fail",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
             Self::PermError => "permerror",
             Self::TempError => "temperror",
-            Self::None      => "none",
+            Self::None => "none",
         })
     }
 }
@@ -46,15 +52,22 @@ pub fn sign(
     private_key_pem: &[u8],
 ) -> Result<Vec<u8>, DkimError> {
     let pk = RsaKey::<Sha256>::from_pkcs8_pem(
-        std::str::from_utf8(private_key_pem)
-            .map_err(|e| DkimError::Sign(e.to_string()))?,
-    ).map_err(|e| DkimError::Sign(e.to_string()))?;
+        std::str::from_utf8(private_key_pem).map_err(|e| DkimError::Sign(e.to_string()))?,
+    )
+    .map_err(|e| DkimError::Sign(e.to_string()))?;
 
     let signature = DkimSigner::from_key(pk)
         .domain(domain)
         .selector(selector)
-        .headers(["From", "To", "Subject", "Date", "Message-ID",
-                  "MIME-Version", "Content-Type"])
+        .headers([
+            "From",
+            "To",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "MIME-Version",
+            "Content-Type",
+        ])
         .sign(raw_message)
         .map_err(|e| DkimError::Sign(e.to_string()))?;
 

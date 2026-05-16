@@ -5,9 +5,9 @@
 //! 2. A/AAAA lookup of each hostname
 //! 3. Confirmed if the original IP appears in step 2
 
+use rmail_dns::Resolver;
 use std::net::IpAddr;
 use tracing::debug;
-use rmail_dns::Resolver;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FcrdnsResult {

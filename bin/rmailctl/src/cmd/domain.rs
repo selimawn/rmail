@@ -48,7 +48,16 @@ pub async fn run(args: DomainArgs, config: &Config) -> anyhow::Result<()> {
         }
 
         DomainCmd::Dns { name, export } => {
-            let server_ip = "<YOUR_SERVER_IP>"; // TODO: read from config or resolve
+            let resolver = Resolver::new(false);
+            let server_ip = match resolver.host(&config.server.hostname).await {
+                Ok(ips) => ips
+                    .into_iter()
+                    .next()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "<YOUR_SERVER_IP>".to_string()),
+                Err(_) => "<YOUR_SERVER_IP>".to_string(),
+            };
+            let server_ip = server_ip.as_str();
             let selector  = config.find_domain(&name)
                 .map(|d| d.dkim_selector.as_str())
                 .unwrap_or("rmail");

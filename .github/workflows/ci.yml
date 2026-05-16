@@ -39,7 +39,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: Build (all crates)
         run: cargo build --workspace
@@ -49,7 +48,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
-        continue-on-error: true
 
   # ─── Release binaries ───────────────────────────────────────────────────────
   # Triggered on version tags (v*) and on pushes to main.

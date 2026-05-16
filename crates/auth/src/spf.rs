@@ -1,7 +1,8 @@
 //! SPF verification using `mail-auth` 0.5.
 
+use mail_auth::{Resolver as MailAuthResolver, SpfResult};
 use std::net::IpAddr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpfVerdict {
@@ -23,11 +24,11 @@ impl SpfVerdict {
 impl std::fmt::Display for SpfVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Self::Pass      => "pass",
-            Self::Fail      => "fail",
-            Self::SoftFail  => "softfail",
-            Self::Neutral   => "neutral",
-            Self::None      => "none",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::SoftFail => "softfail",
+            Self::Neutral => "neutral",
+            Self::None => "none",
             Self::TempError => "temperror",
             Self::PermError => "permerror",
         };
@@ -35,17 +36,35 @@ impl std::fmt::Display for SpfVerdict {
     }
 }
 
-/// Verify SPF for a given MAIL FROM domain and client IP.
+/// Verify SPF for a given MAIL FROM address and connecting client.
 ///
-/// NOTE: Full async DNS-backed SPF verification requires wiring in a
-/// `mail_auth::Resolver` implementation. This stub returns `None` and
-/// will be replaced once the DNS resolver integration is complete.
+/// Uses Cloudflare DNS via `mail_auth`'s built-in resolver.
+/// For the full inbound auth pipeline (SPF + DKIM + DMARC), prefer `checker::verify`.
 pub async fn verify(
-    sender_domain: &str,
+    mail_from: &str,
     client_ip: IpAddr,
     helo: &str,
+    server_hostname: &str,
 ) -> SpfVerdict {
-    // TODO: wire up mail_auth resolver for real SPF evaluation
-    debug!(%sender_domain, %client_ip, %helo, "SPF check (stub — returning None)");
-    SpfVerdict::None
+    let resolver = match MailAuthResolver::new_cloudflare_tls() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Cannot build mail-auth resolver: {e}");
+            return SpfVerdict::TempError;
+        }
+    };
+    let spf = resolver
+        .verify_spf(client_ip, helo, server_hostname, mail_from)
+        .await;
+    let verdict = match spf.result() {
+        SpfResult::Pass => SpfVerdict::Pass,
+        SpfResult::Fail => SpfVerdict::Fail,
+        SpfResult::SoftFail => SpfVerdict::SoftFail,
+        SpfResult::Neutral => SpfVerdict::Neutral,
+        SpfResult::None => SpfVerdict::None,
+        SpfResult::TempError => SpfVerdict::TempError,
+        SpfResult::PermError => SpfVerdict::PermError,
+    };
+    debug!(%mail_from, %client_ip, result = %verdict, "SPF");
+    verdict
 }

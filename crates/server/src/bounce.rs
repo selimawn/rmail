@@ -1,18 +1,11 @@
 //! Bounce message generator.
 //! Sends a DSN (Delivery Status Notification) back to the original sender.
 
-use std::sync::Arc;
-use tracing::{info, warn};
-use rmail_core::{Envelope, Address};
+use rmail_core::{Address, Envelope};
 use rmail_queue::Queue;
-use rmail_core::QueueState;
+use tracing::{info, warn};
 
-pub async fn generate(
-    original: &Envelope,
-    reason: &str,
-    queue: &Queue,
-    server_hostname: &str,
-) {
+pub async fn generate(original: &Envelope, reason: &str, queue: &Queue, server_hostname: &str) {
     if original.from.is_null() {
         // RFC 5321: do NOT generate a bounce for a bounce
         return;
@@ -30,10 +23,10 @@ pub async fn generate(
          \r\n\
          Reason: {reason}\r\n\
          Original message ID: {id}\r\n",
-        host   = server_hostname,
+        host = server_hostname,
         sender = original.from.as_str(),
         reason = reason,
-        id     = original.id,
+        id = original.id,
     );
 
     let bounce_envelope = rmail_core::Envelope::new(

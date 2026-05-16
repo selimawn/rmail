@@ -1,12 +1,12 @@
 //! Core types for rmail.
 //! No I/O, no async. Pure data structures shared by every crate.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 // ─── QueueId ──────────────────────────────────────────────────────────────────────
 
@@ -22,9 +22,7 @@ impl QueueId {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
-        let entropy = (std::process::id() as u64)
-            .wrapping_mul(0x9e3779b97f4a7c15)
-            ^ nanos as u64;
+        let entropy = (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ nanos as u64;
         Self(format!(
             "{}{:02}{:02}{:02}{:02}{:02}.{:06X}",
             now.year(),
@@ -83,20 +81,23 @@ impl Address {
         let at = inner
             .rfind('@')
             .ok_or_else(|| CoreError::InvalidAddress(s.to_owned()))?;
-        let local  = &inner[..at];
+        let local = &inner[..at];
         let domain = &inner[at + 1..];
         if local.is_empty() || domain.is_empty() {
             return Err(CoreError::InvalidAddress(s.to_owned()));
         }
         Ok(Self {
-            local:  local.to_lowercase(),
+            local: local.to_lowercase(),
             domain: domain.to_lowercase(),
         })
     }
 
     /// The null reverse-path used in bounces and DSNs.
     pub fn null() -> Self {
-        Self { local: String::new(), domain: String::new() }
+        Self {
+            local: String::new(),
+            domain: String::new(),
+        }
     }
 
     pub fn is_null(&self) -> bool {
@@ -177,7 +178,10 @@ impl Envelope {
             from,
             recipients: recipients
                 .into_iter()
-                .map(|a| Recipient { address: a, status: DeliveryStatus::Pending })
+                .map(|a| Recipient {
+                    address: a,
+                    status: DeliveryStatus::Pending,
+                })
                 .collect(),
             received_at: OffsetDateTime::now_utc(),
             client_ip,
@@ -189,11 +193,15 @@ impl Envelope {
     }
 
     pub fn pending_recipients(&self) -> impl Iterator<Item = &Recipient> {
-        self.recipients.iter().filter(|r| r.status == DeliveryStatus::Pending)
+        self.recipients
+            .iter()
+            .filter(|r| r.status == DeliveryStatus::Pending)
     }
 
     pub fn all_done(&self) -> bool {
-        self.recipients.iter().all(|r| r.status != DeliveryStatus::Pending)
+        self.recipients
+            .iter()
+            .all(|r| r.status != DeliveryStatus::Pending)
     }
 
     pub fn mark_delivered(&mut self, address: &Address) {
@@ -236,11 +244,11 @@ impl QueueState {
     pub fn dir_name(self) -> &'static str {
         match self {
             Self::Incoming => "incoming",
-            Self::Active   => "active",
+            Self::Active => "active",
             Self::Deferred => "deferred",
-            Self::Hold     => "hold",
-            Self::Bounce   => "bounce",
-            Self::Corrupt  => "corrupt",
+            Self::Hold => "hold",
+            Self::Bounce => "bounce",
+            Self::Corrupt => "corrupt",
         }
     }
 }

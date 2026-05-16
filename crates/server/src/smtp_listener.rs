@@ -10,12 +10,13 @@ use rmail_queue::Queue;
 use rmail_smtp::reply::Reply;
 use rmail_smtp::session::{Action, Session};
 use rmail_tls::TlsAcceptor;
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
@@ -32,6 +33,7 @@ pub async fn run(
     tls: Arc<TlsAcceptor>,
 ) -> Result<()> {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
     let mut tasks = Vec::new();
 
     for addr in addrs {
@@ -39,8 +41,9 @@ pub async fn run(
         let queue = Arc::clone(&queue);
         let tls = Arc::clone(&tls);
         let sem = Arc::clone(&sem);
+        let per_ip = Arc::clone(&per_ip);
         tasks.push(tokio::spawn(async move {
-            accept_loop(addr, config, queue, tls, sem).await
+            accept_loop(addr, config, queue, tls, sem, per_ip).await
         }));
     }
 
@@ -56,6 +59,7 @@ async fn accept_loop(
     queue: Arc<Queue>,
     tls: Arc<TlsAcceptor>,
     sem: Arc<Semaphore>,
+    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "SMTP listening");
@@ -65,8 +69,14 @@ async fn accept_loop(
         let config = Arc::clone(&config);
         let queue = Arc::clone(&queue);
         let tls = Arc::clone(&tls);
+        let per_ip = Arc::clone(&per_ip);
         tokio::spawn(async move {
-            let _permit = permit;
+            let Some(_ip_permit) =
+                IpConnectionPermit::acquire(peer.ip(), &config, per_ip, permit).await
+            else {
+                warn!(peer = %peer, "SMTP per-IP connection limit exceeded");
+                return;
+            };
             let result = if addr.port() == 465 {
                 handle_implicit_tls(stream, peer.ip(), config, queue, tls).await
             } else {
@@ -74,6 +84,50 @@ async fn accept_loop(
             };
             if let Err(e) = result {
                 warn!(peer = %peer, "SMTP session error: {}", e);
+            }
+        });
+    }
+}
+
+struct IpConnectionPermit {
+    ip: IpAddr,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    _global: OwnedSemaphorePermit,
+}
+
+impl IpConnectionPermit {
+    async fn acquire(
+        ip: IpAddr,
+        config: &Config,
+        counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+        global: OwnedSemaphorePermit,
+    ) -> Option<Self> {
+        let mut counts_guard = counts.lock().await;
+        let count = counts_guard.entry(ip).or_default();
+        if *count >= config.rate_limit.smtp_connections_per_ip {
+            return None;
+        }
+        *count += 1;
+        drop(counts_guard);
+        Some(Self {
+            ip,
+            counts,
+            _global: global,
+        })
+    }
+}
+
+impl Drop for IpConnectionPermit {
+    fn drop(&mut self) {
+        let ip = self.ip;
+        let counts = Arc::clone(&self.counts);
+        tokio::spawn(async move {
+            let mut counts = counts.lock().await;
+            if let Some(count) = counts.get_mut(&ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&ip);
+                }
             }
         });
     }

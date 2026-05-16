@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 const PER_MX_TIMEOUT: Duration = Duration::from_secs(120);
+const MTA_STS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn deliver_message(
     envelope: &mut Envelope,
@@ -50,9 +51,14 @@ pub async fn deliver_message(
                 continue;
             }
         };
+        let tls_policy = outbound_tls_policy(domain, config, resolver).await;
 
         let mut delivered_or_permanent = false;
         for (target, mx_hostname) in targets {
+            if !tls_policy.mx_allowed(&mx_hostname) {
+                warn!(id = %envelope.id, %domain, %mx_hostname, "MX rejected by MTA-STS policy");
+                continue;
+            }
             match timeout(
                 PER_MX_TIMEOUT,
                 client::deliver(
@@ -62,6 +68,7 @@ pub async fn deliver_message(
                     &body,
                     &config.server.hostname,
                     &mx_hostname,
+                    tls_policy.require_starttls,
                 ),
             )
             .await
@@ -114,6 +121,104 @@ pub async fn deliver_message(
             }
         }
     }
+}
+
+struct OutboundTlsPolicy {
+    require_starttls: bool,
+    allowed_mx: Vec<String>,
+}
+
+impl OutboundTlsPolicy {
+    fn mx_allowed(&self, mx: &str) -> bool {
+        self.allowed_mx.is_empty()
+            || self
+                .allowed_mx
+                .iter()
+                .any(|pattern| mx_pattern_matches(pattern, mx))
+    }
+}
+
+async fn outbound_tls_policy(
+    domain: &str,
+    config: &Config,
+    resolver: &Resolver,
+) -> OutboundTlsPolicy {
+    let mut policy = OutboundTlsPolicy {
+        require_starttls: config.outbound_tls.require_starttls,
+        allowed_mx: Vec::new(),
+    };
+    if config.outbound_tls.mta_sts {
+        if let Some(sts) = fetch_mta_sts_policy(domain, resolver).await {
+            if sts.mode == "enforce" {
+                policy.require_starttls = true;
+                policy.allowed_mx = sts.mx;
+            }
+        }
+    }
+    if config.outbound_tls.dane {
+        policy.require_starttls = true;
+    }
+    policy
+}
+
+struct MtaStsPolicy {
+    mode: String,
+    mx: Vec<String>,
+}
+
+async fn fetch_mta_sts_policy(domain: &str, resolver: &Resolver) -> Option<MtaStsPolicy> {
+    let txt_name = format!("_mta-sts.{}", domain);
+    let has_sts = resolver
+        .txt(&txt_name)
+        .await
+        .ok()?
+        .iter()
+        .any(|txt| txt.starts_with("v=STSv1"));
+    if !has_sts {
+        return None;
+    }
+    let url = format!("https://mta-sts.{}/.well-known/mta-sts.txt", domain);
+    let body = timeout(MTA_STS_TIMEOUT, reqwest::get(url))
+        .await
+        .ok()?
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    parse_mta_sts_policy(&body)
+}
+
+fn parse_mta_sts_policy(body: &str) -> Option<MtaStsPolicy> {
+    let mut mode = None;
+    let mut mx = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "version" if value.trim() != "STSv1" => return None,
+            "mode" => mode = Some(value.trim().to_ascii_lowercase()),
+            "mx" => mx.push(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    Some(MtaStsPolicy { mode: mode?, mx })
+}
+
+fn mx_pattern_matches(pattern: &str, mx: &str) -> bool {
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+    let mx = mx.trim_end_matches('.').to_ascii_lowercase();
+    if pattern == mx {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return mx.ends_with(suffix) && mx.len() > suffix.len();
+    }
+    false
 }
 
 async fn sign_if_local_sender(envelope: &Envelope, body: Vec<u8>, config: &Config) -> Vec<u8> {

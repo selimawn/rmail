@@ -1217,7 +1217,10 @@ impl PartialOrd for State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmail_config::{Config, DeliveryConfig, DnsConfig, ServerConfig, StorageConfig, TlsConfig};
+    use rmail_config::{
+        Config, DeliveryConfig, DnsConfig, OutboundTlsConfig, RateLimitConfig, ServerConfig,
+        StorageBackend, StorageConfig, TlsConfig,
+    };
     use std::path::PathBuf;
 
     fn test_config() -> Config {
@@ -1231,7 +1234,11 @@ mod tests {
             storage: StorageConfig {
                 queue_dir: PathBuf::from("/tmp/rmail-test-queue"),
                 mailbox_dir: PathBuf::from("/tmp/rmail-test-mail"),
+                backend: StorageBackend::Local,
+                s3: None,
             },
+            rate_limit: RateLimitConfig::default(),
+            outbound_tls: OutboundTlsConfig::default(),
             tls: TlsConfig {
                 cert: PathBuf::from("/tmp/cert.pem"),
                 key: PathBuf::from("/tmp/key.pem"),

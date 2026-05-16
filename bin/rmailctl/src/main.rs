@@ -30,6 +30,9 @@ enum Cmd {
     /// Inspect the mail queue
     #[command(subcommand)]
     Queue(QueueCmd),
+    /// Print storage configuration snippets
+    #[command(subcommand)]
+    Storage(StorageCmd),
     /// Print server status
     Status,
 }
@@ -82,10 +85,35 @@ enum QueueCmd {
     Release { id: String },
 }
 
+#[derive(Debug, Subcommand)]
+enum StorageCmd {
+    /// Print a TOML snippet for S3-compatible object storage
+    S3 {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        region: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        access_key_id: String,
+        #[arg(long)]
+        secret_access_key: String,
+        #[arg(long, default_value_t = false)]
+        path_style: bool,
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let cli = Cli::parse();
+    if let Cmd::Storage(sub) = cli.command {
+        handle_storage(sub);
+        return Ok(());
+    }
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load config: {}", cli.config.display()))?;
 
@@ -93,6 +121,7 @@ async fn main() -> Result<()> {
         Cmd::Domain(sub) => handle_domain(sub, &config).await?,
         Cmd::User(sub) => handle_user(sub, &config).await?,
         Cmd::Queue(sub) => handle_queue(sub, &config).await?,
+        Cmd::Storage(_) => unreachable!("handled before config load"),
         Cmd::Status => handle_status(&config),
     }
     Ok(())
@@ -342,6 +371,37 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn handle_storage(cmd: StorageCmd) {
+    match cmd {
+        StorageCmd::S3 {
+            endpoint,
+            region,
+            bucket,
+            access_key_id,
+            secret_access_key,
+            path_style,
+            prefix,
+        } => {
+            println!("Add or update the following in rmail.toml:\n");
+            println!("[storage]");
+            println!("backend = \"s3\"");
+            println!();
+            println!("[storage.s3]");
+            println!("endpoint = \"{}\"", endpoint);
+            println!("region = \"{}\"", region);
+            println!("bucket = \"{}\"", bucket);
+            println!("access_key_id = \"{}\"", access_key_id);
+            println!("secret_access_key = \"{}\"", secret_access_key);
+            println!("path_style = {}", path_style);
+            println!("prefix = \"{}\"", prefix);
+            println!();
+            println!(
+                "Note: this config is accepted by rmail, but local Maildir/queue storage is still the active engine until the object-store backend is wired."
+            );
+        }
+    }
 }
 
 // ─── status ────────────────────────────────────────────────────────────────

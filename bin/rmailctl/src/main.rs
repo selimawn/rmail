@@ -88,30 +88,35 @@ enum QueueCmd {
 #[derive(Debug, Subcommand)]
 enum StorageCmd {
     /// Print a TOML snippet for S3-compatible object storage
-    S3 {
-        #[arg(long)]
-        endpoint: String,
-        #[arg(long)]
-        region: String,
-        #[arg(long)]
-        bucket: String,
-        #[arg(long)]
-        access_key_id: String,
-        #[arg(long)]
-        secret_access_key: String,
-        #[arg(long, default_value_t = false)]
-        path_style: bool,
-        #[arg(long, default_value = "")]
-        prefix: String,
-    },
+    S3(S3Args),
+    /// Test the configured S3-compatible object store
+    S3Test,
+}
+
+#[derive(Debug, Parser)]
+struct S3Args {
+    #[arg(long)]
+    endpoint: String,
+    #[arg(long)]
+    region: String,
+    #[arg(long)]
+    bucket: String,
+    #[arg(long)]
+    access_key_id: String,
+    #[arg(long)]
+    secret_access_key: String,
+    #[arg(long, default_value_t = false)]
+    path_style: bool,
+    #[arg(long, default_value = "")]
+    prefix: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let cli = Cli::parse();
-    if let Cmd::Storage(sub) = cli.command {
-        handle_storage(sub);
+    if let Cmd::Storage(StorageCmd::S3(args)) = cli.command {
+        print_s3_snippet(args);
         return Ok(());
     }
     let config = Config::load(&cli.config)
@@ -121,7 +126,7 @@ async fn main() -> Result<()> {
         Cmd::Domain(sub) => handle_domain(sub, &config).await?,
         Cmd::User(sub) => handle_user(sub, &config).await?,
         Cmd::Queue(sub) => handle_queue(sub, &config).await?,
-        Cmd::Storage(_) => unreachable!("handled before config load"),
+        Cmd::Storage(sub) => handle_storage(sub, &config).await?,
         Cmd::Status => handle_status(&config),
     }
     Ok(())
@@ -373,35 +378,40 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn handle_storage(cmd: StorageCmd) {
+async fn handle_storage(cmd: StorageCmd, config: &Config) -> Result<()> {
     match cmd {
-        StorageCmd::S3 {
-            endpoint,
-            region,
-            bucket,
-            access_key_id,
-            secret_access_key,
-            path_style,
-            prefix,
-        } => {
-            println!("Add or update the following in rmail.toml:\n");
-            println!("[storage]");
-            println!("backend = \"s3\"");
-            println!();
-            println!("[storage.s3]");
-            println!("endpoint = \"{}\"", endpoint);
-            println!("region = \"{}\"", region);
-            println!("bucket = \"{}\"", bucket);
-            println!("access_key_id = \"{}\"", access_key_id);
-            println!("secret_access_key = \"{}\"", secret_access_key);
-            println!("path_style = {}", path_style);
-            println!("prefix = \"{}\"", prefix);
-            println!();
-            println!(
-                "Note: this config is accepted by rmail, but local Maildir/queue storage is still the active engine until the object-store backend is wired."
-            );
+        StorageCmd::S3(args) => print_s3_snippet(args),
+        StorageCmd::S3Test => {
+            let s3 = config
+                .storage
+                .s3
+                .as_ref()
+                .context("storage.s3 is not configured")?;
+            let store = rmail_storage::S3Store::new(s3);
+            store.healthcheck().await?;
+            println!("S3 storage healthcheck ok.");
         }
     }
+    Ok(())
+}
+
+fn print_s3_snippet(args: S3Args) {
+    println!("Add or update the following in rmail.toml:\n");
+    println!("[storage]");
+    println!("backend = \"s3\"");
+    println!();
+    println!("[storage.s3]");
+    println!("endpoint = \"{}\"", args.endpoint);
+    println!("region = \"{}\"", args.region);
+    println!("bucket = \"{}\"", args.bucket);
+    println!("access_key_id = \"{}\"", args.access_key_id);
+    println!("secret_access_key = \"{}\"", args.secret_access_key);
+    println!("path_style = {}", args.path_style);
+    println!("prefix = \"{}\"", args.prefix);
+    println!();
+    println!(
+        "S3 support is available through rmail-storage. Use `rmailctl storage s3-test` to verify credentials."
+    );
 }
 
 // ─── status ────────────────────────────────────────────────────────────────

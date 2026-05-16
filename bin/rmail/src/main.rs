@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rmail_config::Config;
+use rmail_config::{Config, StorageBackend};
 use rmail_dns::Resolver;
 use rmail_mailbox::Maildir;
 use rmail_queue::Queue;
@@ -39,6 +39,19 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
     let config = Arc::new(config);
     info!(hostname = %config.server.hostname, "rmail starting");
+
+    if config.storage.backend == StorageBackend::S3 {
+        let s3 = config
+            .storage
+            .s3
+            .as_ref()
+            .context("storage.backend=s3 but storage.s3 is missing")?;
+        rmail_storage::S3Store::new(s3)
+            .healthcheck()
+            .await
+            .context("S3 storage healthcheck failed")?;
+        info!(bucket = %s3.bucket, endpoint = %s3.endpoint, "S3 storage healthcheck ok");
+    }
 
     // Shared state
     let queue = Arc::new(

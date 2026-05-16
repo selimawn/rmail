@@ -10,6 +10,7 @@ members  = [
     "crates/dns",
     "crates/tls",
     "crates/auth",
+    "crates/storage",
     "crates/server",
     "bin/rmail",
     "bin/rmailctl",

@@ -5,33 +5,38 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 // ─── QueueId ──────────────────────────────────────────────────────────────────────
 
 /// Unique identifier for a queued message.
-/// Format: `YYYYMMDDHHmmss.XXXXXX` (hex entropy from pid + nanoseconds).
+/// Format: `YYYYMMDDHHmmss.<pid><counter><nanos>` in hex.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueueId(pub String);
 
 impl QueueId {
     pub fn generate() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let now = OffsetDateTime::now_utc();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
-        let entropy = (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ nanos as u64;
+        let pid = std::process::id();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
         Self(format!(
-            "{}{:02}{:02}{:02}{:02}{:02}.{:06X}",
+            "{}{:02}{:02}{:02}{:02}{:02}.{:08X}{:016X}{:08X}",
             now.year(),
             now.month() as u8,
             now.day(),
             now.hour(),
             now.minute(),
             now.second(),
-            entropy & 0xFFFFFF,
+            pid,
+            counter,
+            nanos,
         ))
     }
 }

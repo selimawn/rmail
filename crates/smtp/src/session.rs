@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rmail_config::Config;
 use rmail_core::{Address, Envelope};
 use std::net::IpAddr;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// Maximum line length we accept before hard-closing (prevents memory abuse).
@@ -90,6 +91,18 @@ impl Session {
 
     /// Feed a line from the client. Returns what to do next.
     pub fn step(&mut self, line: &[u8], config: &Config) -> Action {
+        if !line.ends_with(b"\r\n") {
+            if self.state == State::Data {
+                self.reset_transaction();
+                self.state = if self.tls_active {
+                    State::Tls
+                } else {
+                    State::Greeted
+                };
+                return Action::Reply(Reply::new(500, "5.5.2 Bare LF not accepted").to_wire());
+            }
+            return Action::Close(Reply::syntax_error().to_wire());
+        }
         if line.len() > MAX_LINE {
             // RFC 5321 §4.5.3.1.6 — applies to DATA body lines too.
             if self.state == State::Data {
@@ -222,10 +235,8 @@ impl Session {
             if self.auth_user.is_none() {
                 return Action::Reply(Reply::relay_denied().to_wire());
             }
-        } else {
-            if config.find_user(&addr.as_str()).is_none() {
-                return Action::Reply(Reply::user_unknown(&addr.as_str()).to_wire());
-            }
+        } else if config.find_user(&addr.as_str()).is_none() {
+            return Action::Reply(Reply::user_unknown(&addr.as_str()).to_wire());
         }
         self.rcpts.push(addr);
         self.state = State::Rcpt;
@@ -254,7 +265,7 @@ impl Session {
     // ─── DATA body accumulation ────────────────────────────────────────────────
 
     fn handle_data_line(&mut self, line: &[u8], config: &Config) -> Action {
-        if line == b".\r\n" || line == b".\n" || line == b"." {
+        if line == b".\r\n" {
             return self.finalize_data(config);
         }
         let line = if line.starts_with(b"..") {
@@ -264,7 +275,11 @@ impl Session {
         };
         if self.body_buf.len() + line.len() > self.max_size as usize {
             self.reset_transaction();
-            self.state = State::Greeted;
+            self.state = if self.tls_active {
+                State::Tls
+            } else {
+                State::Greeted
+            };
             return Action::Reply(Reply::message_too_large().to_wire());
         }
         self.body_buf.extend_from_slice(line);
@@ -346,24 +361,44 @@ impl Session {
         }
         let Some(user) = decode_b64(username_b64) else {
             warn!(peer = %self.peer_ip, "AUTH LOGIN: invalid base64 username");
-            self.state = State::Greeted;
+            self.state = if self.tls_active {
+                State::Tls
+            } else {
+                State::Greeted
+            };
             return Action::Reply(Reply::auth_fail().to_wire());
         };
         let Some(pass) = decode_b64(line_str) else {
             warn!(peer = %self.peer_ip, %user, "AUTH LOGIN: invalid base64 password");
-            self.state = State::Greeted;
+            self.state = if self.tls_active {
+                State::Tls
+            } else {
+                State::Greeted
+            };
             return Action::Reply(Reply::auth_fail().to_wire());
         };
-        if let Some(u) = config.find_user(&user) {
-            if rmail_auth::password::verify(&pass, &u.password_hash) {
-                info!(peer = %self.peer_ip, %user, "AUTH LOGIN success");
-                self.auth_user = Some(user);
-                self.state = State::Greeted;
-                return Action::Reply(Reply::auth_ok().to_wire());
-            }
+        let cfg_user = config.find_user(&user);
+        let hash = if let Some(u) = cfg_user {
+            u.password_hash.as_str()
+        } else {
+            dummy_password_hash()
+        };
+        if rmail_auth::password::verify(&pass, hash) && cfg_user.is_some() {
+            info!(peer = %self.peer_ip, %user, "AUTH LOGIN success");
+            self.auth_user = Some(user);
+            self.state = if self.tls_active {
+                State::Tls
+            } else {
+                State::Greeted
+            };
+            return Action::Reply(Reply::auth_ok().to_wire());
         }
         warn!(peer = %self.peer_ip, %user, "AUTH LOGIN failed");
-        self.state = State::Greeted;
+        self.state = if self.tls_active {
+            State::Tls
+        } else {
+            State::Greeted
+        };
         Action::Reply(Reply::auth_fail().to_wire())
     }
 
@@ -381,6 +416,8 @@ impl Session {
 
     pub fn mark_tls_active(&mut self) {
         self.tls_active = true;
+        self.helo.clear();
+        self.reset_transaction();
         self.state = State::Connected;
     }
 }
@@ -400,14 +437,32 @@ fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
     if parts.len() < 3 {
         return None;
     }
+    let authzid = std::str::from_utf8(parts[0]).ok()?;
     let user = std::str::from_utf8(parts[1]).ok()?;
     let pass = std::str::from_utf8(parts[2]).ok()?;
-    let cfg_user = config.find_user(user)?;
-    if rmail_auth::password::verify(pass, &cfg_user.password_hash) {
+    if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(user) {
+        let _ = rmail_auth::password::verify(pass, dummy_password_hash());
+        return None;
+    }
+    let cfg_user = config.find_user(user);
+    let hash = if let Some(u) = cfg_user {
+        u.password_hash.as_str()
+    } else {
+        dummy_password_hash()
+    };
+    if rmail_auth::password::verify(pass, hash) && cfg_user.is_some() {
         Some(user.to_owned())
     } else {
         None
     }
+}
+
+fn dummy_password_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        rmail_auth::password::hash("rmail dummy password for missing users")
+            .expect("dummy password hash generation")
+    })
 }
 
 /// Build the `Received:` trace header per RFC 5321 §3.7.2 and prepend it

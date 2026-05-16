@@ -6,7 +6,11 @@ use rmail_dns::Resolver;
 use rmail_smtp::client;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+const PER_MX_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn deliver_message(
     envelope: &mut Envelope,
@@ -43,17 +47,20 @@ pub async fn deliver_message(
 
         let mut delivered_or_permanent = false;
         for (target, mx_hostname) in targets {
-            match client::deliver(
-                target,
-                envelope,
-                addrs,
-                &body,
-                &config.server.hostname,
-                &mx_hostname,
+            match timeout(
+                PER_MX_TIMEOUT,
+                client::deliver(
+                    target,
+                    envelope,
+                    addrs,
+                    &body,
+                    &config.server.hostname,
+                    &mx_hostname,
+                ),
             )
             .await
             {
-                Ok(outcome) => {
+                Ok(Ok(outcome)) => {
                     for (addr, result) in &outcome.rejected {
                         if result.is_permanent() {
                             envelope.mark_failed(addr, result.code, result.message.clone());
@@ -88,8 +95,11 @@ pub async fn deliver_message(
                         "transient delivery failure"
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(id = %envelope.id, %domain, %mx_hostname, "delivery error: {}", e);
+                }
+                Err(_) => {
+                    warn!(id = %envelope.id, %domain, %mx_hostname, "delivery timed out");
                 }
             }
 
@@ -136,6 +146,9 @@ async fn resolve_mx_targets(
     resolver: &Resolver,
 ) -> Option<Vec<(SocketAddr, String)>> {
     let records = resolver.mx(domain).await.ok()?;
+    if records.len() == 1 && records[0].exchange == "." {
+        return None;
+    }
     let mut targets = Vec::new();
     for mx in records {
         if let Ok(ips) = resolver.host(&mx.exchange).await {

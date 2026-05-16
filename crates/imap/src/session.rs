@@ -287,13 +287,14 @@ impl Session {
             .unwrap_or_default();
         let messages = entries.len();
         let unseen = entries.iter().filter(|e| !e.seen).count();
+        let recent = entries.iter().filter(|e| !e.seen && !e.deleted).count();
         let uid_next = next_uid(&entries);
 
         let parts: Vec<String> = items
             .iter()
             .map(|i| match i {
                 StatusItem::Messages => format!("MESSAGES {}", messages),
-                StatusItem::Recent => format!("RECENT {}", unseen),
+                StatusItem::Recent => format!("RECENT {}", recent),
                 StatusItem::UidNext => format!("UIDNEXT {}", uid_next),
                 StatusItem::UidValidity => "UIDVALIDITY 1".into(),
                 StatusItem::Unseen => format!("UNSEEN {}", unseen),
@@ -348,7 +349,7 @@ impl Session {
             let entry = &entries[idx];
             let seq_num = idx + 1;
 
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<Vec<u8>> = Vec::new();
 
             for item in items {
                 match item {
@@ -363,16 +364,19 @@ impl Session {
                         if entry.deleted {
                             flags.push("\\Deleted");
                         }
-                        parts.push(format!("FLAGS ({})", flags.join(" ")));
+                        parts.push(format!("FLAGS ({})", flags.join(" ")).into_bytes());
                     }
                     FetchItem::Rfc822Size => {
-                        parts.push(format!("RFC822.SIZE {}", entry.size));
+                        parts.push(format!("RFC822.SIZE {}", entry.size).into_bytes());
                     }
                     FetchItem::Uid => {
-                        parts.push(format!("UID {}", uid_for_filename(&entry.filename)));
+                        parts.push(
+                            format!("UID {}", uid_for_filename(&entry.filename)).into_bytes(),
+                        );
                     }
                     FetchItem::InternalDate => {
-                        parts.push("INTERNALDATE \"01-Jan-2024 00:00:00 +0000\"".into());
+                        let date = internal_date(entry).await;
+                        parts.push(format!("INTERNALDATE \"{}\"", date).into_bytes());
                     }
                     FetchItem::Rfc822 | FetchItem::Body | FetchItem::BodyPeek(_) => {
                         match maildir.read_message(&entry.path).await {
@@ -382,12 +386,10 @@ impl Session {
                                     FetchItem::Body => "BODY[]",
                                     _ => "BODY[]",
                                 };
-                                parts.push(format!(
-                                    "{} {{{}}}\r\n{}",
-                                    label,
-                                    body.len(),
-                                    String::from_utf8_lossy(&body)
-                                ));
+                                let mut part =
+                                    format!("{} {{{}}}\r\n", label, body.len()).into_bytes();
+                                part.extend_from_slice(&body);
+                                parts.push(part);
                             }
                             Err(e) => warn!("FETCH read_message: {}", e),
                         }
@@ -395,18 +397,17 @@ impl Session {
                     FetchItem::Rfc822Header => match maildir.read_message(&entry.path).await {
                         Ok(body) => {
                             let headers = extract_headers(&body);
-                            parts.push(format!(
-                                "RFC822.HEADER {{{}}}\r\n{}",
-                                headers.len(),
-                                String::from_utf8_lossy(&headers)
-                            ));
+                            let mut part =
+                                format!("RFC822.HEADER {{{}}}\r\n", headers.len()).into_bytes();
+                            part.extend_from_slice(&headers);
+                            parts.push(part);
                         }
                         Err(e) => warn!("FETCH read_message headers: {}", e),
                     },
                     FetchItem::Envelope => match maildir.read_message(&entry.path).await {
                         Ok(body) => {
                             let env = build_envelope_string(&body);
-                            parts.push(format!("ENVELOPE {}", env));
+                            parts.push(format!("ENVELOPE {}", env).into_bytes());
                         }
                         Err(e) => warn!("FETCH envelope: {}", e),
                     },
@@ -414,10 +415,14 @@ impl Session {
             }
 
             if !parts.is_empty() {
-                out.extend(
-                    Response::untagged(format!("{} FETCH ({})", seq_num, parts.join(" ")))
-                        .to_wire(),
-                );
+                out.extend_from_slice(format!("* {} FETCH (", seq_num).as_bytes());
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(part);
+                }
+                out.extend_from_slice(b")\r\n");
             }
         }
 
@@ -541,7 +546,7 @@ impl Session {
                     "FLAGGED" => e.flagged,
                     "UNFLAGGED" => !e.flagged,
                     "DELETED" => e.deleted,
-                    _ => true, // unknown criteria → match all
+                    _ => false,
                 };
                 if matches {
                     Some((i + 1).to_string())
@@ -662,6 +667,19 @@ fn next_uid(entries: &[rmail_mailbox::MaildirEntry]) -> u32 {
 }
 
 fn uid_for_filename(filename: &str) -> u32 {
+    let base = filename.split_once('.').and_then(|(ts, rest)| {
+        let ts = ts.parse::<u32>().ok()?;
+        let counter = rest
+            .split_once('_')
+            .and_then(|(_, suffix)| suffix.split('.').next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        let epoch = ts.saturating_sub(1_600_000_000);
+        Some(epoch.saturating_mul(1024).saturating_add(counter.min(1023)))
+    });
+    if let Some(uid) = base {
+        return uid.max(1);
+    }
     let mut hash: u32 = 2_166_136_261;
     for b in filename.as_bytes() {
         hash ^= *b as u32;
@@ -671,6 +689,20 @@ fn uid_for_filename(filename: &str) -> u32 {
 }
 
 // ─── Message helpers ─────────────────────────────────────────────────────────
+
+async fn internal_date(entry: &rmail_mailbox::MaildirEntry) -> String {
+    let dt = match tokio::fs::metadata(&entry.path)
+        .await
+        .and_then(|m| m.modified())
+    {
+        Ok(modified) => time::OffsetDateTime::from(modified),
+        Err(_) => time::OffsetDateTime::now_utc(),
+    };
+    dt.format(time::macros::format_description!(
+        "[day padding:zero]-[month repr:short]-[year] [hour]:[minute]:[second] [offset_hour sign:mandatory][offset_minute]"
+    ))
+    .unwrap_or_else(|_| "01-Jan-1970 00:00:00 +0000".to_owned())
+}
 
 /// Extract only the header section (everything before the first blank line).
 fn extract_headers(raw: &[u8]) -> Vec<u8> {

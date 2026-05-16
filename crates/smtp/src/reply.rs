@@ -11,7 +11,10 @@ pub struct Reply {
 
 impl Reply {
     pub fn new(code: u16, text: impl Into<String>) -> Self {
-        Self { code, lines: vec![text.into()] }
+        Self {
+            code,
+            lines: vec![text.into()],
+        }
     }
 
     pub fn multiline(code: u16, lines: Vec<String>) -> Self {
@@ -152,7 +155,14 @@ mod tests {
 
     #[test]
     fn wire_multiline() {
-        let r = Reply::multiline(250, vec!["example.com".into(), "SIZE 26214400".into(), "STARTTLS".into()]);
+        let r = Reply::multiline(
+            250,
+            vec![
+                "example.com".into(),
+                "SIZE 26214400".into(),
+                "STARTTLS".into(),
+            ],
+        );
         let wire = String::from_utf8(r.to_wire()).unwrap();
         assert!(wire.starts_with("250-example.com\r\n"));
         assert!(wire.ends_with("250 STARTTLS\r\n"));

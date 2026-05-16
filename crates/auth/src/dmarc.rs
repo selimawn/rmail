@@ -1,12 +1,10 @@
 //! DMARC policy evaluation.
 //! Uses `mail-auth` 0.5.
 
-use mail_auth::{
-    AuthenticatedMessage,
-};
-use tracing::debug;
 use crate::dkim::DkimVerdict;
 use crate::spf::SpfVerdict;
+use mail_auth::AuthenticatedMessage;
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmarcVerdict {
@@ -22,10 +20,10 @@ pub enum DmarcVerdict {
 impl std::fmt::Display for DmarcVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Self::Pass       => "pass",
+            Self::Pass => "pass",
             Self::Quarantine => "quarantine",
-            Self::Reject     => "reject",
-            Self::None       => "none",
+            Self::Reject => "reject",
+            Self::None => "none",
         };
         f.write_str(s)
     }
@@ -35,11 +33,7 @@ impl std::fmt::Display for DmarcVerdict {
 ///
 /// NOTE: Full evaluation requires a DNS-backed resolver. This stub
 /// returns None and will be replaced once resolver integration is complete.
-pub async fn evaluate(
-    raw_message: &[u8],
-    spf: &SpfVerdict,
-    dkim: &DkimVerdict,
-) -> DmarcVerdict {
+pub async fn evaluate(raw_message: &[u8], spf: &SpfVerdict, dkim: &DkimVerdict) -> DmarcVerdict {
     let _msg = match AuthenticatedMessage::parse(raw_message) {
         Some(m) => m,
         Option::None => return DmarcVerdict::None,

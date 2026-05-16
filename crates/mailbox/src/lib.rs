@@ -16,12 +16,12 @@
 //! `tmp/` to `new/`. Every state-changing rename is followed by a parent-
 //! directory fsync so the change is durable across kernel crashes.
 
+use rmail_core::Address;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use tokio::fs;
 use tracing::{debug, info};
-use thiserror::Error;
-use rmail_core::Address;
 
 #[derive(Debug, Error)]
 pub enum MailboxError {
@@ -84,11 +84,7 @@ impl Maildir {
     /// 1. Write to `tmp/<unique>` and fsync.
     /// 2. `rename(tmp/<unique>, new/<unique>)` — atomic.
     /// 3. Fsync `new/` so the rename is durable.
-    pub async fn deliver(
-        &self,
-        address: &Address,
-        body: &[u8],
-    ) -> Result<String, MailboxError> {
+    pub async fn deliver(&self, address: &Address, body: &[u8]) -> Result<String, MailboxError> {
         let base = self.user_dir(address);
         if !base.join("cur").exists() {
             return Err(MailboxError::UserNotFound(address.as_str()));
@@ -126,20 +122,24 @@ impl Maildir {
         let mut entries = Vec::new();
         for (subdir, in_new) in [("new", true), ("cur", false)] {
             let dir = folder_dir.join(subdir);
-            if !dir.exists() { continue; }
+            if !dir.exists() {
+                continue;
+            }
             let mut rd = fs::read_dir(&dir).await?;
             while let Some(entry) = rd.next_entry().await? {
                 let meta = entry.metadata().await?;
-                if !meta.is_file() { continue; }
+                if !meta.is_file() {
+                    continue;
+                }
                 let filename = entry.file_name().to_string_lossy().into_owned();
                 let flags = parse_maildir_flags(&filename);
                 entries.push(MaildirEntry {
-                    path:     entry.path(),
+                    path: entry.path(),
                     filename: filename.clone(),
-                    size:     meta.len(),
-                    seen:     !in_new && flags.contains('S'),
-                    flagged:  flags.contains('F'),
-                    deleted:  flags.contains('T'),
+                    size: meta.len(),
+                    seen: !in_new && flags.contains('S'),
+                    flagged: flags.contains('F'),
+                    deleted: flags.contains('T'),
                 });
             }
         }
@@ -147,10 +147,7 @@ impl Maildir {
     }
 
     /// List all folders for a user (INBOX + Maildir++ subdirs).
-    pub async fn list_folders(
-        &self,
-        address: &Address,
-    ) -> Result<Vec<String>, MailboxError> {
+    pub async fn list_folders(&self, address: &Address) -> Result<Vec<String>, MailboxError> {
         let base = self.user_dir(address);
         if !base.exists() {
             return Err(MailboxError::UserNotFound(address.as_str()));
@@ -220,12 +217,12 @@ impl Maildir {
 
 #[derive(Debug, Clone)]
 pub struct MaildirEntry {
-    pub path:     PathBuf,
+    pub path: PathBuf,
     pub filename: String,
-    pub size:     u64,
-    pub seen:     bool,
-    pub flagged:  bool,
-    pub deleted:  bool,
+    pub size: u64,
+    pub seen: bool,
+    pub flagged: bool,
+    pub deleted: bool,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
@@ -263,7 +260,11 @@ fn add_flag(filename: &str, flag: char) -> String {
         }
         let mut chars: Vec<char> = flags.chars().chain(std::iter::once(flag)).collect();
         chars.sort_unstable();
-        format!("{}:2,{}", &filename[..idx], chars.iter().collect::<String>())
+        format!(
+            "{}:2,{}",
+            &filename[..idx],
+            chars.iter().collect::<String>()
+        )
     } else {
         format!("{}:2,{}", filename, flag)
     }

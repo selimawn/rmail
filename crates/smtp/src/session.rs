@@ -4,13 +4,13 @@
 //! driving it: read a line, call `step()`, write the returned bytes to the
 //! socket. When `step()` returns `Action::Close`, flush and drop.
 
-use std::net::IpAddr;
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use tracing::{debug, info, warn};
-use rmail_core::{Address, Envelope};
-use rmail_config::Config;
 use crate::command::{self, Command};
 use crate::reply::Reply;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rmail_config::Config;
+use rmail_core::{Address, Envelope};
+use std::net::IpAddr;
+use tracing::{debug, info, warn};
 
 /// Maximum line length we accept before hard-closing (prevents memory abuse).
 /// RFC 5321 §4.5.3.1.6 specifies max 1000 octets per line, including CRLF.
@@ -51,7 +51,7 @@ pub enum Action {
     /// Message body complete: deliver this envelope + body to the queue.
     /// Write the included bytes to the socket afterwards.
     Enqueue {
-        envelope: Envelope,
+        envelope: Box<Envelope>,
         body: Vec<u8>,
         reply: Vec<u8>,
     },
@@ -94,7 +94,11 @@ impl Session {
             // RFC 5321 §4.5.3.1.6 — applies to DATA body lines too.
             if self.state == State::Data {
                 self.reset_transaction();
-                self.state = if self.tls_active { State::Tls } else { State::Greeted };
+                self.state = if self.tls_active {
+                    State::Tls
+                } else {
+                    State::Greeted
+                };
                 return Action::Reply(Reply::new(500, "5.5.6 Line too long").to_wire());
             }
             return Action::Close(Reply::syntax_error().to_wire());
@@ -113,7 +117,7 @@ impl Session {
                 };
                 match command::parse(line_str) {
                     Ok(cmd) => self.handle_command(cmd, config),
-                    Err(_)  => Action::Reply(Reply::syntax_error().to_wire()),
+                    Err(_) => Action::Reply(Reply::syntax_error().to_wire()),
                 }
             }
         }
@@ -125,23 +129,27 @@ impl Session {
         debug!(peer = %self.peer_ip, state = ?self.state, ?cmd, "SMTP command");
         match cmd {
             Command::Ehlo(domain) | Command::Helo(domain) => self.do_ehlo(domain, config),
-            Command::StartTls  => self.do_starttls(),
+            Command::StartTls => self.do_starttls(),
             Command::MailFrom { address, size } => self.do_mail_from(address, size, config),
             Command::RcptTo(addr) => self.do_rcpt_to(addr, config),
-            Command::Data        => self.do_data(),
-            Command::Rset        => self.do_rset(),
-            Command::Quit        => Action::Close(Reply::bye().to_wire()),
-            Command::Noop        => Action::Reply(Reply::ok().to_wire()),
+            Command::Data => self.do_data(),
+            Command::Rset => self.do_rset(),
+            Command::Quit => Action::Close(Reply::bye().to_wire()),
+            Command::Noop => Action::Reply(Reply::ok().to_wire()),
             Command::AuthPlain(initial) => self.do_auth_plain(initial, config),
-            Command::AuthLogin   => self.do_auth_login(),
-            Command::Vrfy(_)     => Action::Reply(Reply::new(252, "2.1.5 Cannot VRFY user").to_wire()),
+            Command::AuthLogin => self.do_auth_login(),
+            Command::Vrfy(_) => Action::Reply(Reply::new(252, "2.1.5 Cannot VRFY user").to_wire()),
         }
     }
 
     fn do_ehlo(&mut self, domain: String, config: &Config) -> Action {
         self.helo = domain;
         self.reset_transaction();
-        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        self.state = if self.tls_active {
+            State::Tls
+        } else {
+            State::Greeted
+        };
         Action::Reply(
             Reply::ehlo_caps(
                 &config.server.hostname,
@@ -182,7 +190,8 @@ impl Session {
                             "MAIL FROM spoofing rejected"
                         );
                         return Action::Reply(
-                            Reply::new(553, "5.7.1 Sender address not owned by authenticated user").to_wire(),
+                            Reply::new(553, "5.7.1 Sender address not owned by authenticated user")
+                                .to_wire(),
                         );
                     }
                 }
@@ -203,7 +212,11 @@ impl Session {
         }
         let addr = match Address::parse(&address) {
             Ok(a) => a,
-            Err(_) => return Action::Reply(Reply::new(501, "5.1.3 Bad recipient address syntax").to_wire()),
+            Err(_) => {
+                return Action::Reply(
+                    Reply::new(501, "5.1.3 Bad recipient address syntax").to_wire(),
+                )
+            }
         };
         if !config.is_local_domain(&addr.domain) {
             if self.auth_user.is_none() {
@@ -230,7 +243,11 @@ impl Session {
 
     fn do_rset(&mut self) -> Action {
         self.reset_transaction();
-        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        self.state = if self.tls_active {
+            State::Tls
+        } else {
+            State::Greeted
+        };
         Action::Reply(Reply::ok().to_wire())
     }
 
@@ -240,7 +257,11 @@ impl Session {
         if line == b".\r\n" || line == b".\n" || line == b"." {
             return self.finalize_data(config);
         }
-        let line = if line.starts_with(b"..") { &line[1..] } else { line };
+        let line = if line.starts_with(b"..") {
+            &line[1..]
+        } else {
+            line
+        };
         if self.body_buf.len() + line.len() > self.max_size as usize {
             self.reset_transaction();
             self.state = State::Greeted;
@@ -251,9 +272,9 @@ impl Session {
     }
 
     fn finalize_data(&mut self, config: &Config) -> Action {
-        let from  = self.from.take().unwrap_or_else(Address::null);
+        let from = self.from.take().unwrap_or_else(Address::null);
         let rcpts = std::mem::take(&mut self.rcpts);
-        let raw   = std::mem::take(&mut self.body_buf);
+        let raw = std::mem::take(&mut self.body_buf);
         let envelope = Envelope::new(
             from,
             rcpts,
@@ -266,10 +287,14 @@ impl Session {
         let body = prepend_received(&raw, &envelope, &config.server.hostname);
         let id = envelope.id.to_string();
         info!(id, peer = %self.peer_ip, "message accepted");
-        self.state = if self.tls_active { State::Tls } else { State::Greeted };
+        self.state = if self.tls_active {
+            State::Tls
+        } else {
+            State::Greeted
+        };
         Action::Enqueue {
             reply: Reply::queued(&id).to_wire(),
-            envelope,
+            envelope: Box::new(envelope),
             body,
         }
     }
@@ -283,7 +308,7 @@ impl Session {
         }
         let blob = match initial {
             Some(b) => b,
-            None    => return Action::Reply(Reply::auth_continue("").to_wire()),
+            None => return Action::Reply(Reply::auth_continue("").to_wire()),
         };
         if let Some(user) = verify_plain(&blob, config) {
             info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
@@ -300,14 +325,23 @@ impl Session {
             warn!(peer = %self.peer_ip, "AUTH LOGIN attempted without TLS");
             return Action::Reply(Reply::tls_required().to_wire());
         }
-        self.state = State::AuthLoginPass { username: String::new() };
+        self.state = State::AuthLoginPass {
+            username: String::new(),
+        };
         Action::Reply(Reply::auth_continue("VXNlcm5hbWU6").to_wire())
     }
 
-    fn handle_auth_login_pass(&mut self, line: &[u8], username_b64: &str, config: &Config) -> Action {
+    fn handle_auth_login_pass(
+        &mut self,
+        line: &[u8],
+        username_b64: &str,
+        config: &Config,
+    ) -> Action {
         let line_str = std::str::from_utf8(line).unwrap_or("").trim();
         if username_b64.is_empty() {
-            self.state = State::AuthLoginPass { username: line_str.to_owned() };
+            self.state = State::AuthLoginPass {
+                username: line_str.to_owned(),
+            };
             return Action::Reply(Reply::auth_continue("UGFzc3dvcmQ6").to_wire());
         }
         let Some(user) = decode_b64(username_b64) else {
@@ -363,7 +397,9 @@ fn decode_b64(s: &str) -> Option<String> {
 fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
     let raw = B64.decode(blob.trim()).ok()?;
     let parts: Vec<&[u8]> = raw.splitn(3, |&b| b == 0).collect();
-    if parts.len() < 3 { return None; }
+    if parts.len() < 3 {
+        return None;
+    }
     let user = std::str::from_utf8(parts[1]).ok()?;
     let pass = std::str::from_utf8(parts[2]).ok()?;
     let cfg_user = config.find_user(user)?;
@@ -379,13 +415,20 @@ fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
 /// message is enqueued — so it is part of the original on-disk write and
 /// cannot be duplicated by retries.
 fn prepend_received(body: &[u8], envelope: &Envelope, our_hostname: &str) -> Vec<u8> {
-    let ts = envelope.received_at
+    let ts = envelope
+        .received_at
         .format(&time::format_description::well_known::Rfc2822)
         .unwrap_or_else(|_| "unknown".to_owned());
-    let first_rcpt = envelope.recipients.first()
+    let first_rcpt = envelope
+        .recipients
+        .first()
         .map(|r| r.address.to_string())
         .unwrap_or_else(|| "<unknown>".into());
-    let with = if envelope.auth_user.is_some() { "ESMTPSA" } else { "ESMTP" };
+    let with = if envelope.auth_user.is_some() {
+        "ESMTPSA"
+    } else {
+        "ESMTP"
+    };
     let header = format!(
         "Received: from {} ({} [{}])\r\n\tby {} (rmail) with {} id {}\r\n\tfor {}; {}\r\n",
         envelope.client_helo,

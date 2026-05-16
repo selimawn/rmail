@@ -16,15 +16,13 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use tokio_rustls::{
+    client::TlsStream as ClientTlsStream,
     rustls::{
-        self,
         pki_types::{CertificateDer, PrivateKeyDer, ServerName},
         ClientConfig, RootCertStore, ServerConfig,
     },
-    TlsAcceptor as TokioAcceptor,
-    TlsConnector as TokioConnector,
     server::TlsStream as ServerTlsStream,
-    client::TlsStream as ClientTlsStream,
+    TlsAcceptor as TokioAcceptor, TlsConnector as TokioConnector,
 };
 
 use rustls_pemfile::{certs, private_key};
@@ -82,9 +80,8 @@ impl TlsAcceptor {
             return Err(TlsError::NoCert(cert_path.display().to_string()));
         }
 
-        let key: PrivateKeyDer =
-            private_key(&mut BufReader::new(key_file))?
-                .ok_or_else(|| TlsError::NoKey(key_path.display().to_string()))?;
+        let key: PrivateKeyDer = private_key(&mut BufReader::new(key_file))?
+            .ok_or_else(|| TlsError::NoKey(key_path.display().to_string()))?;
 
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -96,10 +93,7 @@ impl TlsAcceptor {
         })
     }
 
-    pub async fn accept(
-        &self,
-        stream: TcpStream,
-    ) -> Result<ServerTlsStream<TcpStream>, TlsError> {
+    pub async fn accept(&self, stream: TcpStream) -> Result<ServerTlsStream<TcpStream>, TlsError> {
         timeout(TLS_TIMEOUT, self.inner.accept(stream))
             .await
             .map_err(|_| TlsError::Timeout)?
@@ -138,11 +132,7 @@ impl TlsConnector {
         let server_name = ServerName::try_from(domain.to_string())
             .map_err(|_| TlsError::InvalidDnsName(domain.to_string()))?;
 
-        let result = timeout(
-            TLS_TIMEOUT,
-            self.inner.connect(server_name, stream),
-        )
-        .await;
+        let result = timeout(TLS_TIMEOUT, self.inner.connect(server_name, stream)).await;
 
         match result {
             Ok(Ok(tls)) => {
@@ -173,12 +163,4 @@ impl Default for TlsConnector {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ─── Roots ──────────────────────────────────────────────────────────────────
-
-fn webpki_roots_store() -> RootCertStore {
-    let mut store = RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    store
 }

@@ -1,12 +1,12 @@
 //! Outbound SMTP delivery worker.
 
+use rmail_config::Config;
+use rmail_core::Envelope;
+use rmail_dns::Resolver;
+use rmail_smtp::client;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, warn};
-use rmail_core::Envelope;
-use rmail_config::Config;
-use rmail_dns::Resolver;
-use rmail_smtp::client;
 
 pub async fn deliver_message(
     envelope: &mut Envelope,
@@ -16,60 +16,137 @@ pub async fn deliver_message(
 ) {
     let body = match tokio::fs::read(body_path).await {
         Ok(b) => b,
-        Err(e) => { warn!(id = %envelope.id, "cannot read body: {}", e); return; }
+        Err(e) => {
+            warn!(id = %envelope.id, "cannot read body: {}", e);
+            return;
+        }
     };
+    let body = sign_if_local_sender(envelope, body, config).await;
 
     let mut domains: std::collections::HashMap<String, Vec<rmail_core::Address>> =
         std::collections::HashMap::new();
     for rcpt in envelope.pending_recipients() {
-        domains.entry(rcpt.address.domain.clone())
-               .or_default()
-               .push(rcpt.address.clone());
+        domains
+            .entry(rcpt.address.domain.clone())
+            .or_default()
+            .push(rcpt.address.clone());
     }
 
     for (domain, addrs) in &domains {
-        let (target, mx_hostname) = match resolve_mx(domain, resolver).await {
+        let targets = match resolve_mx_targets(domain, resolver).await {
             Some(v) => v,
             None => {
                 warn!(id = %envelope.id, %domain, "MX lookup failed");
-                for addr in addrs {
-                    envelope.mark_failed(addr, 451, format!("MX lookup failed for {}", domain));
-                }
                 continue;
             }
         };
 
-        match client::deliver(target, envelope, &body, &config.server.hostname, &mx_hostname).await {
-            Ok(result) if result.is_success() => {
-                for addr in addrs {
-                    info!(id = %envelope.id, %addr, "remote delivery ok");
-                    envelope.mark_delivered(addr);
+        let mut delivered_or_permanent = false;
+        for (target, mx_hostname) in targets {
+            match client::deliver(
+                target,
+                envelope,
+                addrs,
+                &body,
+                &config.server.hostname,
+                &mx_hostname,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    for (addr, result) in &outcome.rejected {
+                        if result.is_permanent() {
+                            envelope.mark_failed(addr, result.code, result.message.clone());
+                            delivered_or_permanent = true;
+                        }
+                    }
+
+                    if outcome.final_result.is_success() {
+                        for addr in &outcome.accepted {
+                            info!(id = %envelope.id, %addr, %mx_hostname, "remote delivery ok");
+                            envelope.mark_delivered(addr);
+                        }
+                        break;
+                    }
+
+                    if outcome.final_result.is_permanent() {
+                        for addr in &outcome.accepted {
+                            envelope.mark_failed(
+                                addr,
+                                outcome.final_result.code,
+                                outcome.final_result.message.clone(),
+                            );
+                        }
+                        break;
+                    }
+
+                    warn!(
+                        id = %envelope.id,
+                        %domain,
+                        code = outcome.final_result.code,
+                        %mx_hostname,
+                        "transient delivery failure"
+                    );
+                }
+                Err(e) => {
+                    warn!(id = %envelope.id, %domain, %mx_hostname, "delivery error: {}", e);
                 }
             }
-            Ok(result) if result.is_permanent() => {
-                for addr in addrs {
-                    envelope.mark_failed(addr, result.code, result.message.clone());
-                }
-            }
-            Ok(result) => {
-                warn!(id = %envelope.id, code = result.code, "transient delivery failure");
-            }
-            Err(e) => {
-                warn!(id = %envelope.id, %domain, "delivery error: {}", e);
+
+            if delivered_or_permanent {
+                break;
             }
         }
     }
 }
 
-/// Returns (SocketAddr, mx_hostname) for the first reachable MX.
-async fn resolve_mx(domain: &str, resolver: &Resolver) -> Option<(SocketAddr, String)> {
+async fn sign_if_local_sender(envelope: &Envelope, body: Vec<u8>, config: &Config) -> Vec<u8> {
+    if envelope.from.is_null() {
+        return body;
+    }
+    let Some(domain) = config.find_domain(&envelope.from.domain) else {
+        return body;
+    };
+    let key = match tokio::fs::read(&domain.dkim_key).await {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(
+                id = %envelope.id,
+                domain = %domain.name,
+                key = %domain.dkim_key.display(),
+                "DKIM key read failed: {}",
+                e
+            );
+            return body;
+        }
+    };
+    match rmail_auth::dkim::sign(&body, &domain.name, &domain.dkim_selector, &key) {
+        Ok(signed) => signed,
+        Err(e) => {
+            warn!(id = %envelope.id, domain = %domain.name, "DKIM signing failed: {}", e);
+            body
+        }
+    }
+}
+
+/// Returns all MX targets in priority order. Delivery tries each until one
+/// gives a conclusive result.
+async fn resolve_mx_targets(
+    domain: &str,
+    resolver: &Resolver,
+) -> Option<Vec<(SocketAddr, String)>> {
     let records = resolver.mx(domain).await.ok()?;
+    let mut targets = Vec::new();
     for mx in records {
         if let Ok(ips) = resolver.host(&mx.exchange).await {
             for ip in ips {
-                return Some((SocketAddr::new(ip, 25), mx.exchange.clone()));
+                targets.push((SocketAddr::new(ip, 25), mx.exchange.clone()));
             }
         }
     }
-    None
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
+    }
 }

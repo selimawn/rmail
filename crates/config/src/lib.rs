@@ -5,9 +5,9 @@
 //! let config = Config::load(Path::new("/etc/rmail/rmail.toml"))?;
 //! ```
 
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,7 +34,9 @@ pub struct ServerConfig {
     pub max_message_mb: u64,
 }
 
-fn default_max_message_mb() -> u64 { 25 }
+fn default_max_message_mb() -> u64 {
+    25
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -67,17 +69,25 @@ pub struct DeliveryConfig {
     pub bounce_after_hours: u64,
 }
 
-fn default_max_retries() -> u32 { 25 }
-fn default_initial_retry_secs() -> u64 { 300 }
-fn default_max_retry_secs() -> u64 { 14400 }
-fn default_bounce_after_hours() -> u64 { 120 }
+fn default_max_retries() -> u32 {
+    25
+}
+fn default_initial_retry_secs() -> u64 {
+    300
+}
+fn default_max_retry_secs() -> u64 {
+    14400
+}
+fn default_bounce_after_hours() -> u64 {
+    120
+}
 
 impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
-            max_retries:        default_max_retries(),
+            max_retries: default_max_retries(),
             initial_retry_secs: default_initial_retry_secs(),
-            max_retry_secs:     default_max_retry_secs(),
+            max_retry_secs: default_max_retry_secs(),
             bounce_after_hours: default_bounce_after_hours(),
         }
     }
@@ -130,24 +140,32 @@ impl Config {
             return Err(ConfigError::Validation("server.hostname is empty".into()));
         }
         if self.server.listen_smtp.is_empty() {
-            return Err(ConfigError::Validation("server.listen_smtp must have at least one address".into()));
+            return Err(ConfigError::Validation(
+                "server.listen_smtp must have at least one address".into(),
+            ));
         }
         Ok(())
     }
 
     /// Returns true if `domain` is a domain this server hosts.
     pub fn is_local_domain(&self, domain: &str) -> bool {
-        self.domains.iter().any(|d| d.name.eq_ignore_ascii_case(domain))
+        self.domains
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case(domain))
     }
 
     /// Find a user by full email address (case-insensitive).
     pub fn find_user(&self, address: &str) -> Option<&UserConfig> {
-        self.users.iter().find(|u| u.address.eq_ignore_ascii_case(address))
+        self.users
+            .iter()
+            .find(|u| u.address.eq_ignore_ascii_case(address))
     }
 
     /// Find domain config by name (case-insensitive).
     pub fn find_domain(&self, name: &str) -> Option<&DomainConfig> {
-        self.domains.iter().find(|d| d.name.eq_ignore_ascii_case(name))
+        self.domains
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
     }
 
     pub fn max_message_bytes(&self) -> u64 {

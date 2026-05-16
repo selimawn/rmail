@@ -8,7 +8,9 @@ use rmail_tls::TlsAcceptor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -16,6 +18,7 @@ use tracing::{info, warn};
 
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_IMAP_LINE: usize = 8192;
+const MAX_IMAP_LITERAL: usize = 50 * 1024 * 1024;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -81,7 +84,7 @@ async fn handle_plain(
     let mut io = BufReader::new(stream);
     write_all_timeout(&mut io, &greeting).await?;
     loop {
-        let Some(line) = read_line_limited(&mut io, MAX_IMAP_LINE).await? else {
+        let Some(line) = read_imap_command(&mut io).await? else {
             break;
         };
         match session.step(&line, &config, &maildir).await {
@@ -144,7 +147,7 @@ async fn handle_tls_with_greeting(
         write_all_timeout(&mut io, &greeting).await?;
     }
     loop {
-        let Some(line) = read_line_limited(&mut io, MAX_IMAP_LINE).await? else {
+        let Some(line) = read_imap_command(&mut io).await? else {
             break;
         };
         match session.step(&line, &config, &maildir).await {
@@ -204,6 +207,58 @@ where
     })
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))?
+}
+
+async fn read_imap_command<R>(io: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + AsyncWrite + Unpin,
+{
+    let Some(mut line) = read_line_limited(io, MAX_IMAP_LINE).await? else {
+        return Ok(None);
+    };
+    let Some(n) = literal_len(&line) else {
+        return Ok(Some(line));
+    };
+    if n > MAX_IMAP_LITERAL {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "literal too large",
+        ));
+    }
+    if !line.ends_with(b"{0+}\r\n") && !line.ends_with(b"{0+}\n") && !literal_is_nonsync(&line) {
+        write_all_timeout(io, b"+ Ready for literal data\r\n").await?;
+    }
+    let mut literal = vec![0; n];
+    timeout(READ_IDLE_TIMEOUT, io.read_exact(&mut literal))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "literal timeout"))??;
+    line.extend_from_slice(&literal);
+    let mut crlf = [0u8; 2];
+    if timeout(READ_IDLE_TIMEOUT, io.read_exact(&mut crlf))
+        .await
+        .is_ok()
+        && crlf != *b"\r\n"
+    {
+        line.extend_from_slice(&crlf);
+    }
+    Ok(Some(line))
+}
+
+fn literal_len(line: &[u8]) -> Option<usize> {
+    let s = std::str::from_utf8(line)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    let start = s.rfind('{')?;
+    let lit = s[start + 1..].strip_suffix('}')?;
+    let lit = lit.strip_suffix('+').unwrap_or(lit);
+    lit.parse().ok()
+}
+
+fn literal_is_nonsync(line: &[u8]) -> bool {
+    std::str::from_utf8(line)
+        .ok()
+        .map(|s| s.trim_end_matches(['\r', '\n']).ends_with("+}"))
+        .unwrap_or(false)
 }
 
 async fn write_all_timeout<W>(io: &mut W, bytes: &[u8]) -> std::io::Result<()>

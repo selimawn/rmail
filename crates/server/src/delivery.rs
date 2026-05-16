@@ -38,8 +38,14 @@ pub async fn deliver_message(
 
     for (domain, addrs) in &domains {
         let targets = match resolve_mx_targets(domain, resolver).await {
-            Some(v) => v,
-            None => {
+            MxTargets::Targets(v) => v,
+            MxTargets::NullMx => {
+                for addr in addrs {
+                    envelope.mark_failed(addr, 550, "5.1.10 Null MX domain".into());
+                }
+                continue;
+            }
+            MxTargets::LookupFailed => {
                 warn!(id = %envelope.id, %domain, "MX lookup failed");
                 continue;
             }
@@ -141,13 +147,18 @@ async fn sign_if_local_sender(envelope: &Envelope, body: Vec<u8>, config: &Confi
 
 /// Returns all MX targets in priority order. Delivery tries each until one
 /// gives a conclusive result.
-async fn resolve_mx_targets(
-    domain: &str,
-    resolver: &Resolver,
-) -> Option<Vec<(SocketAddr, String)>> {
-    let records = resolver.mx(domain).await.ok()?;
+enum MxTargets {
+    Targets(Vec<(SocketAddr, String)>),
+    NullMx,
+    LookupFailed,
+}
+
+async fn resolve_mx_targets(domain: &str, resolver: &Resolver) -> MxTargets {
+    let Ok(records) = resolver.mx(domain).await else {
+        return MxTargets::LookupFailed;
+    };
     if records.len() == 1 && records[0].exchange == "." {
-        return None;
+        return MxTargets::NullMx;
     }
     let mut targets = Vec::new();
     for mx in records {
@@ -158,8 +169,8 @@ async fn resolve_mx_targets(
         }
     }
     if targets.is_empty() {
-        None
+        MxTargets::LookupFailed
     } else {
-        Some(targets)
+        MxTargets::Targets(targets)
     }
 }

@@ -92,11 +92,15 @@ async fn main() -> Result<()> {
 
     info!("all listeners started");
 
-    // Wait for first task to finish (should never happen unless error)
+    // Wait for first task to finish or for an operator shutdown signal.
     tokio::select! {
         r = smtp_task => { r?.context("SMTP listener exited")?; }
         r = imap_task => { r?.context("IMAP listener exited")?; }
         r = qmgr_task => { r.context("queue manager panicked")?; }
+        r = tokio::signal::ctrl_c() => {
+            r.context("failed to listen for shutdown signal")?;
+            info!("shutdown signal received");
+        }
     }
 
     Ok(())

@@ -7,7 +7,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag_no_case, take_while, take_while1},
     character::complete::{space0, space1},
-    combinator::{map, opt, rest},
+    combinator::{map, map_res, opt, rest},
     sequence::{preceded, tuple},
     IResult,
 };
@@ -111,8 +111,7 @@ fn parse_mail_from(i: &str) -> IResult<&str, Command> {
 
 fn parse_size_param(i: &str) -> IResult<&str, u64> {
     let (i, _) = tag_no_case("SIZE=")(i)?;
-    let (i, n) = take_while1(|c: char| c.is_ascii_digit())(i)?;
-    Ok((i, n.parse().unwrap_or(0)))
+    map_res(take_while1(|c: char| c.is_ascii_digit()), str::parse)(i)
 }
 
 fn parse_rcpt_to(i: &str) -> IResult<&str, Command> {

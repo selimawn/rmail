@@ -78,7 +78,7 @@ impl Response {
 
     pub fn capability_tokens(tls_active: bool) -> &'static str {
         if tls_active {
-            "IMAP4rev2 IMAP4rev1 LITERAL+ SASL-IR AUTH=PLAIN AUTH=LOGIN IDLE UIDPLUS"
+            "IMAP4rev2 IMAP4rev1 LITERAL+ IDLE UIDPLUS MOVE"
         } else {
             "IMAP4rev2 IMAP4rev1 STARTTLS LOGINDISABLED IDLE"
         }

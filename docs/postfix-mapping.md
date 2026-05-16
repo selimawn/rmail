@@ -7,15 +7,15 @@ rmail's architecture mirrors Postfix's, but runs as a single async binary instea
 | Postfix process | rmail location | Job |
 |-----------------|----------------|-----|
 | `master` | `bin/rmail` (`main`) | Boots Tokio, spawns all tasks, supervises shutdown |
-| `smtpd` | `crates/server/src/smtpd/listener.rs` | Accepts SMTP connections (25, 587, 465) |
-| `cleanup` | `crates/server/src/cleanup.rs` | Header validation, Received: line, ID assignment |
+| `smtpd` | `crates/server/src/smtp_listener.rs` + `crates/smtp/src/session.rs` | Accepts SMTP connections (25, 587, 465), validates commands, prepends trace/auth headers |
+| `cleanup` | folded into `crates/smtp/src/session.rs` and `crates/server/src/smtp_listener.rs` | Received header, auth header insertion, queue handoff |
 | `qmgr` | `crates/server/src/queue_manager.rs` | Picks next message, schedules delivery, retries |
-| `smtp` (out) | `crates/server/src/delivery/worker.rs` | MX lookup → SMTP client → write result |
-| `local` | `crates/mailbox/src/deliver.rs` | Drops message into Maildir |
+| `smtp` (out) | `crates/server/src/delivery.rs` + `crates/smtp/src/client.rs` | MX lookup → SMTP client → write result |
+| `local` | `crates/mailbox/src/lib.rs` (`Maildir`) | Drops message into Maildir |
 | `bounce` | `crates/server/src/bounce.rs` | Generates bounce messages on permanent failure |
 | `pickup` | — | Not implemented (no `sendmail` compat in v1) |
-| `trivial-rewrite` | `crates/core/src/address.rs` | Address canonicalization |
-| `tlsmgr` | `crates/tls/src/lib.rs` | rustls config, SNI, cert reload |
+| `trivial-rewrite` | `crates/core/src/lib.rs` (`Address`) | Address canonicalization |
+| `tlsmgr` | `crates/tls/src/lib.rs` | rustls config and STARTTLS/implicit TLS helpers |
 
 ## Communication
 

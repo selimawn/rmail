@@ -85,25 +85,45 @@ impl Maildir {
     /// 2. `rename(tmp/<unique>, new/<unique>)` — atomic.
     /// 3. Fsync `new/` so the rename is durable.
     pub async fn deliver(&self, address: &Address, body: &[u8]) -> Result<String, MailboxError> {
+        self.append_to_folder(address, "INBOX", body, "").await
+    }
+
+    pub async fn append_to_folder(
+        &self,
+        address: &Address,
+        folder: &str,
+        body: &[u8],
+        flags: &str,
+    ) -> Result<String, MailboxError> {
         let base = self.user_dir(address);
         if !base.join("cur").exists() {
             return Err(MailboxError::UserNotFound(address.as_str()));
         }
+        let folder_dir = self.folder_dir(address, folder);
+        if !folder_dir.exists() {
+            return Err(MailboxError::FolderNotFound(folder.to_owned()));
+        }
 
         let filename = unique_filename();
-        let tmp_path = base.join("tmp").join(&filename);
-        let new_path = base.join("new").join(&filename);
+        let tmp_path = folder_dir.join("tmp").join(&filename);
+        let target_name = if flags.is_empty() {
+            filename
+        } else {
+            format!("{}:2,{}", filename, normalize_flags(flags))
+        };
+        let target_subdir = if flags.contains('S') { "cur" } else { "new" };
+        let target_path = folder_dir.join(target_subdir).join(&target_name);
 
         tokio::fs::write(&tmp_path, body).await?;
         {
             let f = tokio::fs::File::open(&tmp_path).await?;
             f.sync_data().await?;
         }
-        tokio::fs::rename(&tmp_path, &new_path).await?;
-        let _ = fsync_dir(&base.join("new")).await;
+        tokio::fs::rename(&tmp_path, &target_path).await?;
+        let _ = fsync_dir(&folder_dir.join(target_subdir)).await;
 
-        debug!(address = %address, file = %filename, bytes = body.len(), "delivered");
-        Ok(filename)
+        debug!(address = %address, folder, file = %target_name, bytes = body.len(), "delivered");
+        Ok(target_name)
     }
 
     // ─── List ─────────────────────────────────────────────────────────────────────────
@@ -140,6 +160,8 @@ impl Maildir {
                     seen: !in_new && flags.contains('S'),
                     flagged: flags.contains('F'),
                     deleted: flags.contains('T'),
+                    answered: flags.contains('R'),
+                    draft: flags.contains('D'),
                 });
             }
         }
@@ -164,10 +186,57 @@ impl Maildir {
         Ok(folders)
     }
 
+    pub async fn create_folder(&self, address: &Address, folder: &str) -> Result<(), MailboxError> {
+        if folder == "INBOX" {
+            return Ok(());
+        }
+        let dir = self.folder_dir(address, folder);
+        for sub in ["cur", "new", "tmp"] {
+            fs::create_dir_all(dir.join(sub)).await?;
+        }
+        fsync_dir(&self.user_dir(address)).await?;
+        Ok(())
+    }
+
+    pub async fn delete_folder(&self, address: &Address, folder: &str) -> Result<(), MailboxError> {
+        if folder == "INBOX" {
+            return Err(MailboxError::FolderNotFound(folder.to_owned()));
+        }
+        let dir = self.folder_dir(address, folder);
+        fs::remove_dir_all(&dir).await?;
+        fsync_dir(&self.user_dir(address)).await?;
+        Ok(())
+    }
+
+    pub async fn rename_folder(
+        &self,
+        address: &Address,
+        from: &str,
+        to: &str,
+    ) -> Result<(), MailboxError> {
+        if from == "INBOX" || to == "INBOX" {
+            return Err(MailboxError::FolderNotFound(from.to_owned()));
+        }
+        fs::rename(self.folder_dir(address, from), self.folder_dir(address, to)).await?;
+        fsync_dir(&self.user_dir(address)).await?;
+        Ok(())
+    }
+
     // ─── Read ────────────────────────────────────────────────────────────────────
 
     pub async fn read_message(&self, path: &PathBuf) -> Result<Vec<u8>, MailboxError> {
         Ok(tokio::fs::read(path).await?)
+    }
+
+    pub async fn copy_message(
+        &self,
+        address: &Address,
+        dest_folder: &str,
+        entry: &MaildirEntry,
+    ) -> Result<String, MailboxError> {
+        let body = self.read_message(&entry.path).await?;
+        self.append_to_folder(address, dest_folder, &body, &entry.flags_string())
+            .await
     }
 
     // ─── Move to cur (IMAP "seen") ─────────────────────────────────────────────────────
@@ -193,9 +262,41 @@ impl Maildir {
 
     /// Mark a message as deleted by adding the T flag.
     pub async fn mark_deleted(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
+        self.set_flags(path, &['T'], FlagOp::Add).await
+    }
+
+    pub async fn set_flags(
+        &self,
+        path: &PathBuf,
+        flags: &[char],
+        op: FlagOp,
+    ) -> Result<PathBuf, MailboxError> {
         let filename = path.file_name().unwrap().to_string_lossy();
-        let new_name = add_flag(&filename, 'T');
-        let parent = path.parent().unwrap().to_owned();
+        let current = parse_maildir_flags(&filename);
+        let mut set: std::collections::BTreeSet<char> = current.chars().collect();
+        match op {
+            FlagOp::Add => {
+                set.extend(flags.iter().copied());
+            }
+            FlagOp::Remove => {
+                for flag in flags {
+                    set.remove(flag);
+                }
+            }
+            FlagOp::Replace => {
+                set = flags.iter().copied().collect();
+            }
+        }
+        let new_name = replace_flags(&filename, &set.iter().collect::<String>());
+        let mut parent = path.parent().unwrap().to_owned();
+        let target_subdir = if set.contains(&'S') { "cur" } else { "new" };
+        if parent
+            .file_name()
+            .map(|n| n != target_subdir)
+            .unwrap_or(false)
+        {
+            parent = parent.parent().unwrap().join(target_subdir);
+        }
         let new_path = parent.join(&new_name);
         tokio::fs::rename(path, &new_path).await?;
         let _ = fsync_dir(&parent).await;
@@ -223,6 +324,37 @@ pub struct MaildirEntry {
     pub seen: bool,
     pub flagged: bool,
     pub deleted: bool,
+    pub answered: bool,
+    pub draft: bool,
+}
+
+impl MaildirEntry {
+    pub fn flags_string(&self) -> String {
+        let mut flags = String::new();
+        if self.seen {
+            flags.push('S');
+        }
+        if self.flagged {
+            flags.push('F');
+        }
+        if self.deleted {
+            flags.push('T');
+        }
+        if self.answered {
+            flags.push('R');
+        }
+        if self.draft {
+            flags.push('D');
+        }
+        normalize_flags(&flags)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FlagOp {
+    Add,
+    Remove,
+    Replace,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
@@ -268,6 +400,22 @@ fn add_flag(filename: &str, flag: char) -> String {
     } else {
         format!("{}:2,{}", filename, flag)
     }
+}
+
+fn replace_flags(filename: &str, flags: &str) -> String {
+    let flags = normalize_flags(flags);
+    if let Some(idx) = filename.rfind(":2,") {
+        format!("{}:2,{}", &filename[..idx], flags)
+    } else {
+        format!("{}:2,{}", filename, flags)
+    }
+}
+
+fn normalize_flags(flags: &str) -> String {
+    let mut chars: Vec<char> = flags.chars().collect();
+    chars.sort_unstable();
+    chars.dedup();
+    chars.iter().collect()
 }
 
 /// fsync(2) a directory so that recent rename/create/unlink operations are

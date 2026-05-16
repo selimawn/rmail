@@ -6,7 +6,11 @@ use rmail_dns::Resolver;
 use rmail_smtp::client;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+const PER_MX_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn deliver_message(
     envelope: &mut Envelope,
@@ -34,8 +38,14 @@ pub async fn deliver_message(
 
     for (domain, addrs) in &domains {
         let targets = match resolve_mx_targets(domain, resolver).await {
-            Some(v) => v,
-            None => {
+            MxTargets::Targets(v) => v,
+            MxTargets::NullMx => {
+                for addr in addrs {
+                    envelope.mark_failed(addr, 550, "5.1.10 Null MX domain".into());
+                }
+                continue;
+            }
+            MxTargets::LookupFailed => {
                 warn!(id = %envelope.id, %domain, "MX lookup failed");
                 continue;
             }
@@ -43,17 +53,20 @@ pub async fn deliver_message(
 
         let mut delivered_or_permanent = false;
         for (target, mx_hostname) in targets {
-            match client::deliver(
-                target,
-                envelope,
-                addrs,
-                &body,
-                &config.server.hostname,
-                &mx_hostname,
+            match timeout(
+                PER_MX_TIMEOUT,
+                client::deliver(
+                    target,
+                    envelope,
+                    addrs,
+                    &body,
+                    &config.server.hostname,
+                    &mx_hostname,
+                ),
             )
             .await
             {
-                Ok(outcome) => {
+                Ok(Ok(outcome)) => {
                     for (addr, result) in &outcome.rejected {
                         if result.is_permanent() {
                             envelope.mark_failed(addr, result.code, result.message.clone());
@@ -88,8 +101,11 @@ pub async fn deliver_message(
                         "transient delivery failure"
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(id = %envelope.id, %domain, %mx_hostname, "delivery error: {}", e);
+                }
+                Err(_) => {
+                    warn!(id = %envelope.id, %domain, %mx_hostname, "delivery timed out");
                 }
             }
 
@@ -131,11 +147,19 @@ async fn sign_if_local_sender(envelope: &Envelope, body: Vec<u8>, config: &Confi
 
 /// Returns all MX targets in priority order. Delivery tries each until one
 /// gives a conclusive result.
-async fn resolve_mx_targets(
-    domain: &str,
-    resolver: &Resolver,
-) -> Option<Vec<(SocketAddr, String)>> {
-    let records = resolver.mx(domain).await.ok()?;
+enum MxTargets {
+    Targets(Vec<(SocketAddr, String)>),
+    NullMx,
+    LookupFailed,
+}
+
+async fn resolve_mx_targets(domain: &str, resolver: &Resolver) -> MxTargets {
+    let Ok(records) = resolver.mx(domain).await else {
+        return MxTargets::LookupFailed;
+    };
+    if records.len() == 1 && records[0].exchange == "." {
+        return MxTargets::NullMx;
+    }
     let mut targets = Vec::new();
     for mx in records {
         if let Ok(ips) = resolver.host(&mx.exchange).await {
@@ -145,8 +169,8 @@ async fn resolve_mx_targets(
         }
     }
     if targets.is_empty() {
-        None
+        MxTargets::LookupFailed
     } else {
-        Some(targets)
+        MxTargets::Targets(targets)
     }
 }

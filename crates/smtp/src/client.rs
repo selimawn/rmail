@@ -7,7 +7,13 @@ use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_REPLY_LINE: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -57,7 +63,9 @@ pub async fn deliver(
     remote_domain: &str,
 ) -> Result<DeliveryOutcome, ClientError> {
     debug!(%target, id = %envelope.id, "connecting");
-    let stream = TcpStream::connect(target).await?;
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     let mut io = BufReader::new(stream);
 
     // Banner
@@ -191,8 +199,8 @@ where
 
     // Body with dot-stuffing
     let stuffed = dot_stuff(body);
-    io.write_all(&stuffed).await?;
-    io.write_all(b"\r\n.\r\n").await?;
+    write_all_timeout(io, &stuffed).await?;
+    write_all_timeout(io, b".\r\n").await?;
 
     let r = read_reply(io).await?;
     info!(id = %envelope.id, code = r.code, "delivery result");
@@ -210,8 +218,17 @@ async fn read_reply<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<DeliveryRes
     let mut full = String::new();
     let code = loop {
         let mut line = String::new();
-        if r.read_line(&mut line).await? == 0 {
+        let n = timeout(COMMAND_TIMEOUT, r.read_line(&mut line))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "reply timeout"))??;
+        if n == 0 {
             return Err(ClientError::Eof);
+        }
+        if line.len() > MAX_REPLY_LINE {
+            return Err(ClientError::Smtp {
+                code: 500,
+                message: "reply line too long".into(),
+            });
         }
         let trimmed = line.trim_end();
         if trimmed.len() < 3 {
@@ -235,19 +252,55 @@ async fn send_recv<S: AsyncBufRead + AsyncWrite + Unpin>(
     io: &mut S,
     cmd: &str,
 ) -> Result<DeliveryResult, ClientError> {
-    io.write_all(cmd.as_bytes()).await?;
+    write_all_timeout(io, cmd.as_bytes()).await?;
     read_reply(io).await
 }
 
 fn dot_stuff(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 16);
+    let normalized = normalize_crlf(body);
+    let mut out = Vec::with_capacity(normalized.len() + 16);
     let mut bol = true;
-    for &b in body {
+    for &b in &normalized {
         if bol && b == b'.' {
             out.push(b'.');
         }
         out.push(b);
         bol = b == b'\n';
+    }
+    if !out.ends_with(b"\r\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+async fn write_all_timeout<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    bytes: &[u8],
+) -> Result<(), ClientError> {
+    timeout(WRITE_TIMEOUT, io.write_all(bytes))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))??;
+    Ok(())
+}
+
+fn normalize_crlf(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 16);
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'\r' if body.get(i + 1) == Some(&b'\n') => {
+                out.extend_from_slice(b"\r\n");
+                i += 2;
+            }
+            b'\r' | b'\n' => {
+                out.extend_from_slice(b"\r\n");
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
     }
     out
 }
@@ -257,14 +310,18 @@ mod tests {
     use super::*;
     #[test]
     fn dot_stuff_normal() {
-        assert_eq!(dot_stuff(b"hello\r\nworld"), b"hello\r\nworld");
+        assert_eq!(dot_stuff(b"hello\r\nworld"), b"hello\r\nworld\r\n");
     }
     #[test]
     fn dot_stuff_leading_dot() {
-        assert_eq!(dot_stuff(b".leading"), b"..leading");
+        assert_eq!(dot_stuff(b".leading"), b"..leading\r\n");
     }
     #[test]
     fn dot_stuff_mid_line_dot() {
-        assert_eq!(dot_stuff(b"hel.lo"), b"hel.lo");
+        assert_eq!(dot_stuff(b"hel.lo"), b"hel.lo\r\n");
+    }
+    #[test]
+    fn dot_stuff_normalizes_lf_and_stuffs_each_line() {
+        assert_eq!(dot_stuff(b"a\n.b\r\n"), b"a\r\n..b\r\n");
     }
 }

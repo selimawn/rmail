@@ -39,14 +39,14 @@ We keep the **same logical separation** but collapse it to a **single async bina
 | Postfix | rmail |
 |---------|-------|
 | `master` | `bin/rmail` main + Tokio runtime |
-| `smtpd` (port 25/587/465) | `server::smtpd::listener` |
-| `smtp` (outbound) | `server::delivery::worker` |
-| `cleanup` | `server::cleanup::task` |
-| `qmgr` | `server::queue::manager` |
-| `local` | `mailbox::deliver_local` |
+| `smtpd` (port 25/587/465) | `server::smtp_listener` + `smtp::session` |
+| `smtp` (outbound) | `server::delivery` + `smtp::client` |
+| `cleanup` | folded into inbound SMTP session/listener |
+| `qmgr` | `server::queue_manager` |
+| `local` | `mailbox::Maildir` |
 | `bounce` | `server::bounce::generate` |
 | `pickup` | not needed (no `sendmail` compat in v1) |
-| `trivial-rewrite` | `core::address::canonicalize` |
+| `trivial-rewrite` | `core::Address::parse` |
 
 ## 4. Workspace layout
 
@@ -110,7 +110,7 @@ No `async-trait`. No `Box<dyn Anything>` unless we have a measured reason. Concr
 ```rust
 // crates/core/src/lib.rs
 
-pub struct QueueId(pub String);          // e.g. "20260426143012.A1B2C3"
+pub struct QueueId(pub String);          // e.g. "20260426143012.000000010000000000000001A1B2C3D4"
 
 pub struct Address {
     pub local: String,
@@ -120,11 +120,13 @@ pub struct Address {
 pub struct Envelope {
     pub id: QueueId,
     pub from: Address,                    // MAIL FROM
-    pub to: Vec<Address>,                 // RCPT TO
+    pub recipients: Vec<Recipient>,       // RCPT TO plus per-recipient delivery status
     pub received_at: OffsetDateTime,
     pub client_ip: IpAddr,
     pub client_helo: String,
     pub auth_user: Option<String>,        // Some(_) = authenticated submission
+    pub retry_count: u32,
+    pub next_retry_at: Option<i64>,
 }
 
 pub struct Message {
@@ -172,4 +174,5 @@ One message = one file. Lock-free (atomic rename from `tmp/` to `new/`). IMAP se
 
 ```toml
 [server]
-hostname        
+hostname = "mail.example.com"
+```

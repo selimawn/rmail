@@ -6,6 +6,7 @@
 //! ```
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -143,6 +144,41 @@ impl Config {
             return Err(ConfigError::Validation(
                 "server.listen_smtp must have at least one address".into(),
             ));
+        }
+        if self.server.listen_imap.is_empty() {
+            return Err(ConfigError::Validation(
+                "server.listen_imap must have at least one address".into(),
+            ));
+        }
+        if self.server.max_message_mb == 0 {
+            return Err(ConfigError::Validation(
+                "server.max_message_mb must be greater than zero".into(),
+            ));
+        }
+        let mut domains = HashSet::new();
+        for domain in &self.domains {
+            if domain.name.trim().is_empty() || !domain.name.contains('.') {
+                return Err(ConfigError::Validation(format!(
+                    "invalid domain name: {}",
+                    domain.name
+                )));
+            }
+            if !domains.insert(domain.name.to_ascii_lowercase()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate domain: {}",
+                    domain.name
+                )));
+            }
+        }
+        for user in &self.users {
+            let addr = rmail_core::Address::parse(&user.address)
+                .map_err(|_| ConfigError::Validation(format!("invalid user: {}", user.address)))?;
+            if !domains.contains(&addr.domain) {
+                return Err(ConfigError::Validation(format!(
+                    "user domain is not configured: {}",
+                    user.address
+                )));
+            }
         }
         Ok(())
     }

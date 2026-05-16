@@ -69,6 +69,8 @@ impl Reply {
             format!("SIZE {}", max_size),
             "8BITMIME".to_owned(),
             "SMTPUTF8".to_owned(),
+            "ENHANCEDSTATUSCODES".to_owned(),
+            "PIPELINING".to_owned(),
         ];
         if !tls_active {
             lines.push("STARTTLS".to_owned());

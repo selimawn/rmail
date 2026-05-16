@@ -30,9 +30,9 @@ impl AuthResults {
         )
     }
 
-    /// True when DMARC policy says we MUST reject this message.
+    /// True when local policy should reject this message.
     pub fn should_reject(&self) -> Option<&'static str> {
-        if self.dmarc == DmarcOutcome::Reject {
+        if matches!(self.dmarc, DmarcOutcome::Reject | DmarcOutcome::Quarantine) {
             Some("Message rejected due to DMARC policy")
         } else {
             None

@@ -26,7 +26,8 @@
 //! files (a partial transition) are deleted, envelopes without a body are
 //! quarantined into `corrupt/`.
 
-use rmail_core::{Envelope, Message, QueueState};
+use rmail_core::{Envelope, Message, QueueId, QueueState};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs;
@@ -78,30 +79,51 @@ impl Queue {
     /// Accept a message into `incoming/`.
     /// Body first, envelope second, then directory fsync. After this returns
     /// Ok the message is durable: a kernel crash cannot lose it.
-    pub async fn enqueue(&self, envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
-        let id = envelope.id.to_string();
-        debug!(%id, bytes = body.len(), "enqueue");
+    pub async fn enqueue(&self, mut envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
         let incoming = self.dir(QueueState::Incoming);
+        loop {
+            let id = envelope.id.to_string();
+            let eml = self.eml_path(QueueState::Incoming, &id);
+            let env = self.env_path(QueueState::Incoming, &id);
+            if fs::try_exists(&eml).await? || fs::try_exists(&env).await? {
+                envelope.id = QueueId::generate();
+                continue;
+            }
+            debug!(%id, bytes = body.len(), "enqueue");
 
-        // 1. Write body, fsync data
-        let eml = self.eml_path(QueueState::Incoming, &id);
-        let mut f = fs::File::create(&eml).await?;
-        f.write_all(body).await?;
-        f.sync_data().await?;
-        drop(f);
+            // 1. Write body, fsync data
+            let mut f = match create_new(&eml).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    envelope.id = QueueId::generate();
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            f.write_all(body).await?;
+            f.sync_data().await?;
+            drop(f);
 
-        // 2. Write envelope (commit marker), fsync data
-        let env_bytes = bincode::serialize(&envelope)?;
-        let env = self.env_path(QueueState::Incoming, &id);
-        let mut f = fs::File::create(&env).await?;
-        f.write_all(&env_bytes).await?;
-        f.sync_data().await?;
-        drop(f);
+            // 2. Write envelope (commit marker), fsync data
+            let env_bytes = bincode::serialize(&envelope)?;
+            let mut f = match create_new(&env).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&eml).await;
+                    envelope.id = QueueId::generate();
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            f.write_all(&env_bytes).await?;
+            f.sync_data().await?;
+            drop(f);
 
-        // 3. Fsync directory so both new entries are durable
-        fsync_dir(&incoming).await?;
+            // 3. Fsync directory so both new entries are durable
+            fsync_dir(&incoming).await?;
 
-        Ok(id)
+            return Ok(id);
+        }
     }
 
     // ─── State transitions ───────────────────────────────────────────────────────
@@ -295,4 +317,12 @@ async fn fsync_dir(path: &Path) -> std::io::Result<()> {
     let f = fs::File::open(path).await?;
     f.sync_all().await?;
     Ok(())
+}
+
+async fn create_new(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
 }

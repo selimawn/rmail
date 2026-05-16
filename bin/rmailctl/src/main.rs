@@ -211,6 +211,11 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
         UserCmd::Add { address } => {
             let password = prompt_password("New password: ")?;
             let hash = rmail_auth::password::hash(&password)?;
+            let addr = rmail_core::Address::parse(&address)
+                .with_context(|| format!("invalid user address: {}", address))?;
+            rmail_mailbox::Maildir::new(config.storage.mailbox_dir.clone())
+                .create_user(&addr)
+                .await?;
             println!("Add to rmail.toml:");
             println!();
             println!("[[user]]");
@@ -276,6 +281,10 @@ async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
                     println!("Received: {}", env.received_at);
                     println!("Client:   {} ({})", env.client_helo, env.client_ip);
                     println!("Retries:  {}", env.retry_count);
+                    println!("Recipients:");
+                    for recipient in &env.recipients {
+                        println!("  {}  {:?}", recipient.address, recipient.status);
+                    }
                     println!("Size:     {} bytes", msg.size);
                     return Ok(());
                 }
@@ -388,10 +397,5 @@ fn parse_queue_state(s: &str) -> Result<rmail_core::QueueState> {
 }
 
 fn prompt_password(prompt: &str) -> Result<String> {
-    use std::io::Write;
-    print!("{}", prompt);
-    std::io::stdout().flush()?;
-    let mut pw = String::new();
-    std::io::stdin().read_line(&mut pw)?;
-    Ok(pw.trim().to_owned())
+    Ok(rpassword::prompt_password(prompt)?)
 }

@@ -1,9 +1,7 @@
 //! DMARC policy evaluation.
 //! Uses `mail-auth` 0.5.
 
-use mail_auth::{
-    dmarc::Policy, AuthenticatedMessage, DmarcResult, Resolver as MailAuthResolver,
-};
+use mail_auth::{dmarc::Policy, AuthenticatedMessage, DmarcResult, Resolver as MailAuthResolver};
 use std::net::IpAddr;
 use tracing::{debug, warn};
 

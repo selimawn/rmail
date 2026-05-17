@@ -42,12 +42,14 @@ async fn main() -> Result<()> {
 
     // Shared state
     let queue = Arc::new(
-        Queue::new(config.storage.queue_dir.clone())
+        Queue::from_storage_config(&config.storage)
             .await
-            .context("failed to initialise queue directory")?,
+            .context("failed to initialise queue")?,
     );
     queue.recover().await.context("failed to recover queue")?;
-    let maildir = Arc::new(Maildir::new(config.storage.mailbox_dir.clone()));
+    let maildir = Arc::new(
+        Maildir::from_storage_config(&config.storage).context("failed to initialise mailbox")?,
+    );
     let resolver = Arc::new(Resolver::new(config.dns.dnssec));
     let tls = Arc::new(
         TlsAcceptor::from_pem(&config.tls.cert, &config.tls.key)

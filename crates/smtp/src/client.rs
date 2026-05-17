@@ -61,6 +61,7 @@ pub async fn deliver(
     body: &[u8],
     our_hostname: &str,
     remote_domain: &str,
+    require_starttls: bool,
 ) -> Result<DeliveryOutcome, ClientError> {
     debug!(%target, id = %envelope.id, "connecting");
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
@@ -127,6 +128,11 @@ pub async fn deliver(
                 }
             }
         }
+    } else if require_starttls {
+        return Err(ClientError::Tls(format!(
+            "{} did not advertise STARTTLS",
+            remote_domain
+        )));
     }
 
     deliver_inner(&mut io, envelope, recipients, body).await

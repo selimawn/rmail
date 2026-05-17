@@ -14,6 +14,30 @@ max_message_mb  = 25
 [storage]
 queue_dir   = "/var/lib/rmail/queue"
 mailbox_dir = "/var/lib/rmail/mail"
+backend     = "local"
+
+# Optional S3-compatible storage configuration. This is configuration surface
+# for object-storage deployments; the current engine still uses local Maildir
+# and queue paths unless the storage backend is wired by the deployment.
+# [storage.s3]
+# endpoint = "https://s3.example.com"
+# region = "us-east-1"
+# bucket = "rmail"
+# access_key_id = "REPLACE_ME"
+# secret_access_key = "REPLACE_ME"
+# path_style = true
+# prefix = "prod/"
+
+[rate_limit]
+smtp_connections_per_ip = 32
+
+[outbound_tls]
+# require_starttls forces outbound SMTP delivery to fail if an MX does not
+# advertise STARTTLS. mta_sts enables RFC 8461 policy discovery and enforce
+# mode when the recipient domain publishes it.
+require_starttls = false
+mta_sts = true
+dane = false
 
 [tls]
 # Server-wide cert. Renewed via `rmailctl tls renew`.

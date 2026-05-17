@@ -12,6 +12,7 @@ rmail-config  = { path = "../../crates/config" }
 rmail-dns     = { path = "../../crates/dns" }
 rmail-auth    = { path = "../../crates/auth" }
 rmail-mailbox = { path = "../../crates/mailbox" }
+rmail-storage = { path = "../../crates/storage" }
 rmail-core    = { path = "../../crates/core" }
 rmail-queue   = { path = "../../crates/queue" }
 tokio         = { workspace = true }

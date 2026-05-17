@@ -11,6 +11,7 @@ path = "src/main.rs"
 rmail-config  = { path = "../../crates/config" }
 rmail-queue   = { path = "../../crates/queue" }
 rmail-mailbox = { path = "../../crates/mailbox" }
+rmail-storage = { path = "../../crates/storage" }
 rmail-dns     = { path = "../../crates/dns" }
 rmail-tls     = { path = "../../crates/tls" }
 rmail-server  = { path = "../../crates/server" }

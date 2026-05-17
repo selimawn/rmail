@@ -60,7 +60,7 @@ async fn tick(
 
         if all_local {
             // Read body once, deliver to all local recipients
-            let body = match tokio::fs::read(&msg.body_path).await {
+            let body = match queue.read_body(QueueState::Active, &id).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(%id, "body read error: {}", e);
@@ -88,7 +88,14 @@ async fn tick(
             }
         } else {
             // Remote delivery — handled by delivery worker
-            crate::delivery::deliver_message(&mut envelope, &msg.body_path, config, resolver).await;
+            let body = match queue.read_body(QueueState::Active, &id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(%id, "body read error: {}", e);
+                    continue;
+                }
+            };
+            crate::delivery::deliver_message(&mut envelope, body, config, resolver).await;
         }
 
         if envelope.all_done() {

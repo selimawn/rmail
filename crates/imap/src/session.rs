@@ -754,19 +754,13 @@ impl Session {
             .unwrap_or_default();
         let criteria = tokenize_search(criteria);
 
-        let matching: Vec<String> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                let body = std::fs::read(&e.path).unwrap_or_default();
-                let matches = search_matches(&criteria, e, &body);
-                if matches {
-                    Some((i + 1).to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut matching = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let body = maildir.read_message(&e.path).await.unwrap_or_default();
+            if search_matches(&criteria, e, &body) {
+                matching.push((i + 1).to_string());
+            }
+        }
 
         let result = if matching.is_empty() {
             "SEARCH".to_owned()
@@ -1217,7 +1211,10 @@ impl PartialOrd for State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmail_config::{Config, DeliveryConfig, DnsConfig, ServerConfig, StorageConfig, TlsConfig};
+    use rmail_config::{
+        Config, DeliveryConfig, DnsConfig, OutboundTlsConfig, RateLimitConfig, ServerConfig,
+        StorageBackend, StorageConfig, TlsConfig,
+    };
     use std::path::PathBuf;
 
     fn test_config() -> Config {
@@ -1231,7 +1228,11 @@ mod tests {
             storage: StorageConfig {
                 queue_dir: PathBuf::from("/tmp/rmail-test-queue"),
                 mailbox_dir: PathBuf::from("/tmp/rmail-test-mail"),
+                backend: StorageBackend::Local,
+                s3: None,
             },
+            rate_limit: RateLimitConfig::default(),
+            outbound_tls: OutboundTlsConfig::default(),
             tls: TlsConfig {
                 cert: PathBuf::from("/tmp/cert.pem"),
                 key: PathBuf::from("/tmp/key.pem"),

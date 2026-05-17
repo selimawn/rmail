@@ -15,6 +15,10 @@ use thiserror::Error;
 pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub outbound_tls: OutboundTlsConfig,
     pub tls: TlsConfig,
     #[serde(default)]
     pub dns: DnsConfig,
@@ -43,6 +47,69 @@ fn default_max_message_mb() -> u64 {
 pub struct StorageConfig {
     pub queue_dir: PathBuf,
     pub mailbox_dir: PathBuf,
+    #[serde(default)]
+    pub backend: StorageBackend,
+    #[serde(default)]
+    pub s3: Option<S3StorageConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    #[default]
+    Local,
+    S3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct S3StorageConfig {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub path_style: bool,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_smtp_connections_per_ip")]
+    pub smtp_connections_per_ip: usize,
+}
+
+fn default_smtp_connections_per_ip() -> usize {
+    32
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            smtp_connections_per_ip: default_smtp_connections_per_ip(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundTlsConfig {
+    #[serde(default)]
+    pub require_starttls: bool,
+    #[serde(default)]
+    pub mta_sts: bool,
+    #[serde(default)]
+    pub dane: bool,
+}
+
+impl Default for OutboundTlsConfig {
+    fn default() -> Self {
+        Self {
+            require_starttls: false,
+            mta_sts: true,
+            dane: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +221,28 @@ impl Config {
             return Err(ConfigError::Validation(
                 "server.max_message_mb must be greater than zero".into(),
             ));
+        }
+        if self.rate_limit.smtp_connections_per_ip == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit.smtp_connections_per_ip must be greater than zero".into(),
+            ));
+        }
+        if self.storage.backend == StorageBackend::S3 && self.storage.s3.is_none() {
+            return Err(ConfigError::Validation(
+                "storage.backend = \"s3\" requires [storage.s3]".into(),
+            ));
+        }
+        if let Some(s3) = &self.storage.s3 {
+            if s3.endpoint.is_empty()
+                || s3.region.is_empty()
+                || s3.bucket.is_empty()
+                || s3.access_key_id.is_empty()
+                || s3.secret_access_key.is_empty()
+            {
+                return Err(ConfigError::Validation(
+                    "storage.s3 endpoint, region, bucket, access_key_id and secret_access_key are required".into(),
+                ));
+            }
         }
         let mut domains = HashSet::new();
         for domain in &self.domains {

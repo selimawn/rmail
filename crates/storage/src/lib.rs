@@ -1,8 +1,7 @@
 //! Storage backends for rmail.
 //!
-//! The mail engine still uses local Maildir/queue paths today, but this crate
-//! provides the object-store implementation used by tooling and future queue /
-//! mailbox backends.
+//! The mail engine uses this object-store implementation for S3-backed queue
+//! storage and for rmailctl storage checks.
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;

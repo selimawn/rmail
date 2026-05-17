@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rmail_config::{Config, StorageBackend};
+use rmail_config::Config;
 use rmail_dns::Resolver;
 use rmail_mailbox::Maildir;
 use rmail_queue::Queue;
@@ -40,27 +40,16 @@ async fn main() -> Result<()> {
     let config = Arc::new(config);
     info!(hostname = %config.server.hostname, "rmail starting");
 
-    if config.storage.backend == StorageBackend::S3 {
-        let s3 = config
-            .storage
-            .s3
-            .as_ref()
-            .context("storage.backend=s3 but storage.s3 is missing")?;
-        rmail_storage::S3Store::new(s3)
-            .healthcheck()
-            .await
-            .context("S3 storage healthcheck failed")?;
-        info!(bucket = %s3.bucket, endpoint = %s3.endpoint, "S3 storage healthcheck ok");
-    }
-
     // Shared state
     let queue = Arc::new(
-        Queue::new(config.storage.queue_dir.clone())
+        Queue::from_storage_config(&config.storage)
             .await
-            .context("failed to initialise queue directory")?,
+            .context("failed to initialise queue")?,
     );
     queue.recover().await.context("failed to recover queue")?;
-    let maildir = Arc::new(Maildir::new(config.storage.mailbox_dir.clone()));
+    let maildir = Arc::new(
+        Maildir::from_storage_config(&config.storage).context("failed to initialise mailbox")?,
+    );
     let resolver = Arc::new(Resolver::new(config.dns.dnssec));
     let tls = Arc::new(
         TlsAcceptor::from_pem(&config.tls.cert, &config.tls.key)

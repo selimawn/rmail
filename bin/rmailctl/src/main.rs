@@ -247,7 +247,7 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
             let hash = rmail_auth::password::hash(&password)?;
             let addr = rmail_core::Address::parse(&address)
                 .with_context(|| format!("invalid user address: {}", address))?;
-            rmail_mailbox::Maildir::new(config.storage.mailbox_dir.clone())
+            rmail_mailbox::Maildir::from_storage_config(&config.storage)?
                 .create_user(&addr)
                 .await?;
             println!("Add to rmail.toml:");
@@ -278,7 +278,7 @@ async fn handle_user(cmd: UserCmd, config: &Config) -> Result<()> {
 // ─── queue ────────────────────────────────────────────────────────────────
 
 async fn handle_queue(cmd: QueueCmd, config: &Config) -> Result<()> {
-    let queue = rmail_queue::Queue::new(config.storage.queue_dir.clone()).await?;
+    let queue = rmail_queue::Queue::from_storage_config(&config.storage).await?;
     match cmd {
         QueueCmd::List { state } => {
             let qstate = parse_queue_state(&state)?;

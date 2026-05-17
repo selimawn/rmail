@@ -754,19 +754,13 @@ impl Session {
             .unwrap_or_default();
         let criteria = tokenize_search(criteria);
 
-        let matching: Vec<String> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                let body = std::fs::read(&e.path).unwrap_or_default();
-                let matches = search_matches(&criteria, e, &body);
-                if matches {
-                    Some((i + 1).to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut matching = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let body = maildir.read_message(&e.path).await.unwrap_or_default();
+            if search_matches(&criteria, e, &body) {
+                matching.push((i + 1).to_string());
+            }
+        }
 
         let result = if matching.is_empty() {
             "SEARCH".to_owned()

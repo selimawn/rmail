@@ -5,7 +5,6 @@ use rmail_core::Envelope;
 use rmail_dns::Resolver;
 use rmail_smtp::client;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -15,17 +14,10 @@ const MTA_STS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn deliver_message(
     envelope: &mut Envelope,
-    body_path: &PathBuf,
+    body: Vec<u8>,
     config: &Config,
     resolver: &Resolver,
 ) {
-    let body = match tokio::fs::read(body_path).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(id = %envelope.id, "cannot read body: {}", e);
-            return;
-        }
-    };
     let body = sign_if_local_sender(envelope, body, config).await;
 
     let mut domains: std::collections::HashMap<String, Vec<rmail_core::Address>> =

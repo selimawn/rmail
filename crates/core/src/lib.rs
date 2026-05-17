@@ -4,7 +4,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -224,12 +223,12 @@ impl Envelope {
 
 // ─── Message ──────────────────────────────────────────────────────────────────────
 
-/// A complete queued message: envelope metadata + path to raw RFC 5322 body on disk.
+/// A complete queued message: envelope metadata + storage-local body reference.
 /// The body is *never* loaded into memory by this type.
 pub struct Message {
     pub envelope: Envelope,
-    /// Path to the `.eml` file (raw RFC 5322 bytes, dot-stuffing already decoded).
-    pub body_path: PathBuf,
+    /// Backend-local reference to the raw RFC 5322 body.
+    pub body_ref: String,
     pub size: u64,
 }
 

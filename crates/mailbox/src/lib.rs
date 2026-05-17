@@ -16,7 +16,10 @@
 //! `tmp/` to `new/`. Every state-changing rename is followed by a parent-
 //! directory fsync so the change is durable across kernel crashes.
 
+use rmail_config::{StorageBackend, StorageConfig};
 use rmail_core::Address;
+use rmail_storage::{S3Store, StorageError};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -31,15 +34,33 @@ pub enum MailboxError {
     UserNotFound(String),
     #[error("folder not found: {0}")]
     FolderNotFound(String),
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("storage.backend = \"s3\" requires [storage.s3]")]
+    MissingS3Config,
 }
 
 pub struct Maildir {
     root: PathBuf,
+    s3: Option<S3Store>,
 }
 
 impl Maildir {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, s3: None }
+    }
+
+    pub fn from_storage_config(config: &StorageConfig) -> Result<Self, MailboxError> {
+        match config.backend {
+            StorageBackend::Local => Ok(Self::new(config.mailbox_dir.clone())),
+            StorageBackend::S3 => {
+                let s3 = config.s3.as_ref().ok_or(MailboxError::MissingS3Config)?;
+                Ok(Self {
+                    root: config.mailbox_dir.clone(),
+                    s3: Some(S3Store::new(s3)),
+                })
+            }
+        }
     }
 
     fn user_dir(&self, address: &Address) -> PathBuf {
@@ -56,10 +77,55 @@ impl Maildir {
         }
     }
 
+    fn user_prefix(&self, address: &Address) -> String {
+        format!("mail/{}/{}/", address.domain, address.local)
+    }
+
+    fn folder_prefix(&self, address: &Address, folder: &str) -> String {
+        if folder == "INBOX" {
+            self.user_prefix(address)
+        } else {
+            format!("{}.{}/", self.user_prefix(address), folder)
+        }
+    }
+
+    fn resolve_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.root.join(path)
+        }
+    }
+
+    async fn s3_user_exists(
+        &self,
+        store: &S3Store,
+        address: &Address,
+    ) -> Result<bool, MailboxError> {
+        Ok(!store
+            .list(&format!("{}cur/", self.user_prefix(address)))
+            .await?
+            .is_empty())
+    }
+
     // ─── Provisioning ─────────────────────────────────────────────────────────────
 
     /// Create the full Maildir++ structure for a new user.
     pub async fn create_user(&self, address: &Address) -> Result<(), MailboxError> {
+        if let Some(store) = &self.s3 {
+            for folder in ["INBOX", "Sent", "Drafts", "Trash", "Junk"] {
+                for sub in ["cur", "new", "tmp"] {
+                    store
+                        .put(
+                            &format!("{}{}/.keep", self.folder_prefix(address, folder), sub),
+                            Vec::new(),
+                        )
+                        .await?;
+                }
+            }
+            info!(address = %address, "s3 maildir created");
+            return Ok(());
+        }
         let base = self.user_dir(address);
         for sub in ["cur", "new", "tmp"] {
             fs::create_dir_all(base.join(sub)).await?;
@@ -74,6 +140,9 @@ impl Maildir {
     }
 
     pub async fn user_exists(&self, address: &Address) -> bool {
+        if let Some(store) = &self.s3 {
+            return self.s3_user_exists(store, address).await.unwrap_or(false);
+        }
         self.user_dir(address).join("cur").exists()
     }
 
@@ -95,6 +164,26 @@ impl Maildir {
         body: &[u8],
         flags: &str,
     ) -> Result<String, MailboxError> {
+        if let Some(store) = &self.s3 {
+            if !self.s3_user_exists(store, address).await? {
+                return Err(MailboxError::UserNotFound(address.as_str()));
+            }
+            let prefix = self.folder_prefix(address, folder);
+            if folder != "INBOX" && store.list(&prefix).await?.is_empty() {
+                return Err(MailboxError::FolderNotFound(folder.to_owned()));
+            }
+            let filename = unique_filename();
+            let target_name = if flags.is_empty() {
+                filename
+            } else {
+                format!("{}:2,{}", filename, normalize_flags(flags))
+            };
+            let target_subdir = if flags.contains('S') { "cur" } else { "new" };
+            let key = format!("{}{}/{}", prefix, target_subdir, target_name);
+            store.put(&key, body.to_vec()).await?;
+            debug!(address = %address, folder, file = %target_name, bytes = body.len(), "s3 delivered");
+            return Ok(target_name);
+        }
         let base = self.user_dir(address);
         if !base.join("cur").exists() {
             return Err(MailboxError::UserNotFound(address.as_str()));
@@ -134,6 +223,38 @@ impl Maildir {
         address: &Address,
         folder: &str,
     ) -> Result<Vec<MaildirEntry>, MailboxError> {
+        if let Some(store) = &self.s3 {
+            let folder_prefix = self.folder_prefix(address, folder);
+            if folder != "INBOX" && store.list(&folder_prefix).await?.is_empty() {
+                return Err(MailboxError::FolderNotFound(folder.to_owned()));
+            }
+            let mut entries = Vec::new();
+            for (subdir, in_new) in [("new", true), ("cur", false)] {
+                let prefix = format!("{}{}/", folder_prefix, subdir);
+                for key in store.list(&prefix).await? {
+                    let Some(filename) = key.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if filename == ".keep" || filename.contains('/') {
+                        continue;
+                    }
+                    let filename = filename.to_owned();
+                    let body = store.get(&key).await?;
+                    let flags = parse_maildir_flags(&filename);
+                    entries.push(MaildirEntry {
+                        path: PathBuf::from(key),
+                        filename: filename.clone(),
+                        size: body.len() as u64,
+                        seen: !in_new && flags.contains('S'),
+                        flagged: flags.contains('F'),
+                        deleted: flags.contains('T'),
+                        answered: flags.contains('R'),
+                        draft: flags.contains('D'),
+                    });
+                }
+            }
+            return Ok(entries);
+        }
         let folder_dir = self.folder_dir(address, folder);
         if !folder_dir.exists() {
             return Err(MailboxError::FolderNotFound(folder.to_owned()));
@@ -170,6 +291,24 @@ impl Maildir {
 
     /// List all folders for a user (INBOX + Maildir++ subdirs).
     pub async fn list_folders(&self, address: &Address) -> Result<Vec<String>, MailboxError> {
+        if let Some(store) = &self.s3 {
+            if !self.s3_user_exists(store, address).await? {
+                return Err(MailboxError::UserNotFound(address.as_str()));
+            }
+            let base = self.user_prefix(address);
+            let mut folders = BTreeSet::from(["INBOX".to_owned()]);
+            for key in store.list(&base).await? {
+                let Some(rest) = key.strip_prefix(&base) else {
+                    continue;
+                };
+                if let Some(stripped) = rest.strip_prefix('.') {
+                    if let Some((folder, _)) = stripped.split_once('/') {
+                        folders.insert(folder.to_owned());
+                    }
+                }
+            }
+            return Ok(folders.into_iter().collect());
+        }
         let base = self.user_dir(address);
         if !base.exists() {
             return Err(MailboxError::UserNotFound(address.as_str()));
@@ -190,6 +329,17 @@ impl Maildir {
         if folder == "INBOX" {
             return Ok(());
         }
+        if let Some(store) = &self.s3 {
+            for sub in ["cur", "new", "tmp"] {
+                store
+                    .put(
+                        &format!("{}{}/.keep", self.folder_prefix(address, folder), sub),
+                        Vec::new(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
         let dir = self.folder_dir(address, folder);
         for sub in ["cur", "new", "tmp"] {
             fs::create_dir_all(dir.join(sub)).await?;
@@ -201,6 +351,13 @@ impl Maildir {
     pub async fn delete_folder(&self, address: &Address, folder: &str) -> Result<(), MailboxError> {
         if folder == "INBOX" {
             return Err(MailboxError::FolderNotFound(folder.to_owned()));
+        }
+        if let Some(store) = &self.s3 {
+            let prefix = self.folder_prefix(address, folder);
+            for key in store.list(&prefix).await? {
+                store.delete(&key).await?;
+            }
+            return Ok(());
         }
         let dir = self.folder_dir(address, folder);
         fs::remove_dir_all(&dir).await?;
@@ -217,6 +374,21 @@ impl Maildir {
         if from == "INBOX" || to == "INBOX" {
             return Err(MailboxError::FolderNotFound(from.to_owned()));
         }
+        if let Some(store) = &self.s3 {
+            let from_prefix = self.folder_prefix(address, from);
+            let to_prefix = self.folder_prefix(address, to);
+            let keys = store.list(&from_prefix).await?;
+            if keys.is_empty() {
+                return Err(MailboxError::FolderNotFound(from.to_owned()));
+            }
+            for key in keys {
+                let body = store.get(&key).await?;
+                let new_key = key.replacen(&from_prefix, &to_prefix, 1);
+                store.put(&new_key, body).await?;
+                store.delete(&key).await?;
+            }
+            return Ok(());
+        }
         fs::rename(self.folder_dir(address, from), self.folder_dir(address, to)).await?;
         fsync_dir(&self.user_dir(address)).await?;
         Ok(())
@@ -224,8 +396,11 @@ impl Maildir {
 
     // ─── Read ────────────────────────────────────────────────────────────────────
 
-    pub async fn read_message(&self, path: &PathBuf) -> Result<Vec<u8>, MailboxError> {
-        Ok(tokio::fs::read(path).await?)
+    pub async fn read_message(&self, path: &Path) -> Result<Vec<u8>, MailboxError> {
+        if let Some(store) = &self.s3 {
+            return Ok(store.get(&path.to_string_lossy()).await?.to_vec());
+        }
+        Ok(tokio::fs::read(self.resolve_path(path)).await?)
     }
 
     pub async fn copy_message(
@@ -244,7 +419,21 @@ impl Maildir {
     /// Move a message from `new/` to `cur/` when IMAP selects the mailbox.
     /// Appends `:2,S` flags to the filename. The `cur/` directory is fsynced
     /// so the rename survives a crash.
-    pub async fn move_to_cur(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
+    pub async fn move_to_cur(&self, path: &Path) -> Result<PathBuf, MailboxError> {
+        if let Some(store) = &self.s3 {
+            let key = path.to_string_lossy();
+            let filename = s3_filename(&key)?;
+            let new_name = if filename.contains(":2,") {
+                add_flag(filename, 'S')
+            } else {
+                format!("{}:2,S", filename)
+            };
+            let new_key = s3_replace_subdir_and_name(&key, "cur", &new_name)?;
+            let body = store.get(&key).await?;
+            store.put(&new_key, body).await?;
+            store.delete(&key).await?;
+            return Ok(PathBuf::from(new_key));
+        }
         let filename = path.file_name().unwrap().to_string_lossy();
         let new_name = if filename.contains(":2,") {
             add_flag(&filename, 'S')
@@ -261,16 +450,42 @@ impl Maildir {
     // ─── Expunge / delete ────────────────────────────────────────────────────────────
 
     /// Mark a message as deleted by adding the T flag.
-    pub async fn mark_deleted(&self, path: &PathBuf) -> Result<PathBuf, MailboxError> {
+    pub async fn mark_deleted(&self, path: &Path) -> Result<PathBuf, MailboxError> {
         self.set_flags(path, &['T'], FlagOp::Add).await
     }
 
     pub async fn set_flags(
         &self,
-        path: &PathBuf,
+        path: &Path,
         flags: &[char],
         op: FlagOp,
     ) -> Result<PathBuf, MailboxError> {
+        if let Some(store) = &self.s3 {
+            let key = path.to_string_lossy();
+            let filename = s3_filename(&key)?;
+            let current = parse_maildir_flags(filename);
+            let mut set: BTreeSet<char> = current.chars().collect();
+            match op {
+                FlagOp::Add => {
+                    set.extend(flags.iter().copied());
+                }
+                FlagOp::Remove => {
+                    for flag in flags {
+                        set.remove(flag);
+                    }
+                }
+                FlagOp::Replace => {
+                    set = flags.iter().copied().collect();
+                }
+            }
+            let new_name = replace_flags(filename, &set.iter().collect::<String>());
+            let target_subdir = if set.contains(&'S') { "cur" } else { "new" };
+            let new_key = s3_replace_subdir_and_name(&key, target_subdir, &new_name)?;
+            let body = store.get(&key).await?;
+            store.put(&new_key, body).await?;
+            store.delete(&key).await?;
+            return Ok(PathBuf::from(new_key));
+        }
         let filename = path.file_name().unwrap().to_string_lossy();
         let current = parse_maildir_flags(&filename);
         let mut set: std::collections::BTreeSet<char> = current.chars().collect();
@@ -298,15 +513,19 @@ impl Maildir {
             parent = parent.parent().unwrap().join(target_subdir);
         }
         let new_path = parent.join(&new_name);
-        tokio::fs::rename(path, &new_path).await?;
+        tokio::fs::rename(self.resolve_path(path), &new_path).await?;
         let _ = fsync_dir(&parent).await;
         Ok(new_path)
     }
 
     /// Permanently remove a message file (called on EXPUNGE).
-    pub async fn expunge(&self, path: &PathBuf) -> Result<(), MailboxError> {
+    pub async fn expunge(&self, path: &Path) -> Result<(), MailboxError> {
+        if let Some(store) = &self.s3 {
+            store.delete(&path.to_string_lossy()).await?;
+            return Ok(());
+        }
         let parent = path.parent().map(|p| p.to_owned());
-        tokio::fs::remove_file(path).await?;
+        tokio::fs::remove_file(self.resolve_path(path)).await?;
         if let Some(p) = parent {
             let _ = fsync_dir(&p).await;
         }
@@ -416,6 +635,31 @@ fn normalize_flags(flags: &str) -> String {
     chars.sort_unstable();
     chars.dedup();
     chars.iter().collect()
+}
+
+fn s3_filename(key: &str) -> Result<&str, MailboxError> {
+    key.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| MailboxError::FolderNotFound(key.to_owned()))
+}
+
+fn s3_replace_subdir_and_name(
+    key: &str,
+    target_subdir: &str,
+    new_name: &str,
+) -> Result<String, MailboxError> {
+    let mut parts = key.rsplitn(3, '/');
+    let _name = parts
+        .next()
+        .ok_or_else(|| MailboxError::FolderNotFound(key.to_owned()))?;
+    let _subdir = parts
+        .next()
+        .ok_or_else(|| MailboxError::FolderNotFound(key.to_owned()))?;
+    let base = parts
+        .next()
+        .ok_or_else(|| MailboxError::FolderNotFound(key.to_owned()))?;
+    Ok(format!("{}/{}/{}", base, target_subdir, new_name))
 }
 
 /// fsync(2) a directory so that recent rename/create/unlink operations are

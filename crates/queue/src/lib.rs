@@ -26,7 +26,10 @@
 //! files (a partial transition) are deleted, envelopes without a body are
 //! quarantined into `corrupt/`.
 
+use rmail_config::{StorageBackend, StorageConfig};
 use rmail_core::{Envelope, Message, QueueId, QueueState};
+use rmail_storage::{S3Store, StorageError};
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -40,15 +43,115 @@ pub enum QueueError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Bincode(#[from] bincode::Error),
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("storage.backend = \"s3\" requires [storage.s3]")]
+    MissingS3Config,
 }
 
 pub struct Queue {
-    root: PathBuf,
+    backend: QueueBackend,
+}
+
+enum QueueBackend {
+    Local(LocalQueue),
+    S3(S3Queue),
 }
 
 impl Queue {
     /// Create a Queue handle and ensure all subdirectories exist.
     pub async fn new(root: PathBuf) -> Result<Self, QueueError> {
+        Ok(Self {
+            backend: QueueBackend::Local(LocalQueue::new(root).await?),
+        })
+    }
+
+    pub async fn from_storage_config(config: &StorageConfig) -> Result<Self, QueueError> {
+        match config.backend {
+            StorageBackend::Local => Self::new(config.queue_dir.clone()).await,
+            StorageBackend::S3 => {
+                let s3 = config.s3.as_ref().ok_or(QueueError::MissingS3Config)?;
+                let store = S3Store::new(s3);
+                store.healthcheck().await?;
+                Ok(Self {
+                    backend: QueueBackend::S3(S3Queue::new(store)),
+                })
+            }
+        }
+    }
+
+    pub async fn enqueue(&self, envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.enqueue(envelope, body).await,
+            QueueBackend::S3(q) => q.enqueue(envelope, body).await,
+        }
+    }
+
+    pub async fn transition(
+        &self,
+        id: &str,
+        from: QueueState,
+        to: QueueState,
+    ) -> Result<(), QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.transition(id, from, to).await,
+            QueueBackend::S3(q) => q.transition(id, from, to).await,
+        }
+    }
+
+    pub async fn load(&self, state: QueueState, id: &str) -> Result<Message, QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.load(state, id).await,
+            QueueBackend::S3(q) => q.load(state, id).await,
+        }
+    }
+
+    pub async fn read_body(&self, state: QueueState, id: &str) -> Result<Vec<u8>, QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.read_body(state, id).await,
+            QueueBackend::S3(q) => q.read_body(state, id).await,
+        }
+    }
+
+    pub async fn update_envelope(
+        &self,
+        state: QueueState,
+        envelope: &Envelope,
+    ) -> Result<(), QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.update_envelope(state, envelope).await,
+            QueueBackend::S3(q) => q.update_envelope(state, envelope).await,
+        }
+    }
+
+    pub async fn list(&self, state: QueueState) -> Result<Vec<String>, QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.list(state).await,
+            QueueBackend::S3(q) => q.list(state).await,
+        }
+    }
+
+    pub async fn remove(&self, state: QueueState, id: &str) -> Result<(), QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.remove(state, id).await,
+            QueueBackend::S3(q) => q.remove(state, id).await,
+        }
+    }
+
+    pub async fn recover(&self) -> Result<RecoveryReport, QueueError> {
+        match &self.backend {
+            QueueBackend::Local(q) => q.recover().await,
+            QueueBackend::S3(q) => q.recover().await,
+        }
+    }
+}
+
+struct LocalQueue {
+    root: PathBuf,
+}
+
+impl LocalQueue {
+    async fn new(root: PathBuf) -> Result<Self, QueueError> {
         for state in [
             QueueState::Incoming,
             QueueState::Active,
@@ -79,7 +182,7 @@ impl Queue {
     /// Accept a message into `incoming/`.
     /// Body first, envelope second, then directory fsync. After this returns
     /// Ok the message is durable: a kernel crash cannot lose it.
-    pub async fn enqueue(&self, mut envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
+    async fn enqueue(&self, mut envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
         let incoming = self.dir(QueueState::Incoming);
         loop {
             let id = envelope.id.to_string();
@@ -137,7 +240,7 @@ impl Queue {
     ///   - envelope is still in the source dir (message remains in old state)
     ///
     /// Both directories are fsynced before returning.
-    pub async fn transition(
+    async fn transition(
         &self,
         id: &str,
         from: QueueState,
@@ -157,7 +260,7 @@ impl Queue {
     // ─── Load ────────────────────────────────────────────────────────────────────
 
     /// Load a message from a queue directory.
-    pub async fn load(&self, state: QueueState, id: &str) -> Result<Message, QueueError> {
+    async fn load(&self, state: QueueState, id: &str) -> Result<Message, QueueError> {
         let env_path = self.env_path(state, id);
         let eml_path = self.eml_path(state, id);
         let env_bytes = fs::read(&env_path).await?;
@@ -165,16 +268,20 @@ impl Queue {
         let size = fs::metadata(&eml_path).await?.len();
         Ok(Message {
             envelope,
-            body_path: eml_path,
+            body_ref: eml_path.to_string_lossy().into_owned(),
             size,
         })
+    }
+
+    async fn read_body(&self, state: QueueState, id: &str) -> Result<Vec<u8>, QueueError> {
+        Ok(fs::read(self.eml_path(state, id)).await?)
     }
 
     // ─── Update envelope ─────────────────────────────────────────────────────────
 
     /// Rewrite the envelope in-place after updating delivery status.
     /// Tmp file + rename for atomicity, then dir fsync.
-    pub async fn update_envelope(
+    async fn update_envelope(
         &self,
         state: QueueState,
         envelope: &Envelope,
@@ -195,7 +302,7 @@ impl Queue {
     // ─── List ────────────────────────────────────────────────────────────────────
 
     /// List all message IDs present in a queue state directory.
-    pub async fn list(&self, state: QueueState) -> Result<Vec<String>, QueueError> {
+    async fn list(&self, state: QueueState) -> Result<Vec<String>, QueueError> {
         let mut ids = Vec::new();
         let mut rd = match fs::read_dir(self.dir(state)).await {
             Ok(rd) => rd,
@@ -215,7 +322,7 @@ impl Queue {
     // ─── Remove ──────────────────────────────────────────────────────────────────
 
     /// Delete both files for a message (called after successful delivery).
-    pub async fn remove(&self, state: QueueState, id: &str) -> Result<(), QueueError> {
+    async fn remove(&self, state: QueueState, id: &str) -> Result<(), QueueError> {
         if let Err(e) = fs::remove_file(self.env_path(state, id)).await {
             warn!(%id, "could not remove .env: {}", e);
         }
@@ -238,7 +345,7 @@ impl Queue {
     ///   picked up on the next pass. The orphan body is deleted.
     /// - `.env` without matching `.eml`: envelope claims a message we cannot
     ///   find. Quarantine it into `corrupt/` for human inspection.
-    pub async fn recover(&self) -> Result<RecoveryReport, QueueError> {
+    async fn recover(&self) -> Result<RecoveryReport, QueueError> {
         let mut report = RecoveryReport::default();
 
         for state in [
@@ -299,6 +406,189 @@ impl Queue {
         );
         Ok(report)
     }
+}
+
+struct S3Queue {
+    store: S3Store,
+}
+
+impl S3Queue {
+    fn new(store: S3Store) -> Self {
+        Self { store }
+    }
+
+    fn env_key(&self, state: QueueState, id: &str) -> String {
+        format!("queue/{}/{}.env", state.dir_name(), id)
+    }
+
+    fn eml_key(&self, state: QueueState, id: &str) -> String {
+        format!("queue/{}/{}.eml", state.dir_name(), id)
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, QueueError> {
+        match self.store.get(key).await {
+            Ok(_) => Ok(true),
+            Err(StorageError::S3(e)) if is_not_found(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn enqueue(&self, mut envelope: Envelope, body: &[u8]) -> Result<String, QueueError> {
+        loop {
+            let id = envelope.id.to_string();
+            let eml = self.eml_key(QueueState::Incoming, &id);
+            let env = self.env_key(QueueState::Incoming, &id);
+            if self.exists(&eml).await? || self.exists(&env).await? {
+                envelope.id = QueueId::generate();
+                continue;
+            }
+            debug!(%id, bytes = body.len(), "s3 enqueue");
+            self.store.put(&eml, body.to_vec()).await?;
+            self.store.put(&env, bincode::serialize(&envelope)?).await?;
+            return Ok(id);
+        }
+    }
+
+    async fn transition(
+        &self,
+        id: &str,
+        from: QueueState,
+        to: QueueState,
+    ) -> Result<(), QueueError> {
+        debug!(%id, from = from.dir_name(), to = to.dir_name(), "s3 queue transition");
+        let from_eml = self.eml_key(from, id);
+        let from_env = self.env_key(from, id);
+        let to_eml = self.eml_key(to, id);
+        let to_env = self.env_key(to, id);
+        let body = self.store.get(&from_eml).await?;
+        let env = self.store.get(&from_env).await?;
+        self.store.put(&to_eml, body).await?;
+        self.store.put(&to_env, env).await?;
+        self.store.delete(&from_env).await?;
+        self.store.delete(&from_eml).await?;
+        Ok(())
+    }
+
+    async fn load(&self, state: QueueState, id: &str) -> Result<Message, QueueError> {
+        let env_key = self.env_key(state, id);
+        let eml_key = self.eml_key(state, id);
+        let env_bytes = self.store.get(&env_key).await?;
+        let envelope: Envelope = bincode::deserialize(&env_bytes)?;
+        let body = self.store.get(&eml_key).await?;
+        Ok(Message {
+            envelope,
+            body_ref: eml_key,
+            size: body.len() as u64,
+        })
+    }
+
+    async fn read_body(&self, state: QueueState, id: &str) -> Result<Vec<u8>, QueueError> {
+        Ok(self.store.get(&self.eml_key(state, id)).await?.to_vec())
+    }
+
+    async fn update_envelope(
+        &self,
+        state: QueueState,
+        envelope: &Envelope,
+    ) -> Result<(), QueueError> {
+        self.store
+            .put(
+                &self.env_key(state, &envelope.id.to_string()),
+                bincode::serialize(envelope)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list(&self, state: QueueState) -> Result<Vec<String>, QueueError> {
+        let keys = self
+            .store
+            .list(&format!("queue/{}/", state.dir_name()))
+            .await?;
+        let mut ids = keys
+            .into_iter()
+            .filter_map(|key| {
+                key.strip_prefix(&format!("queue/{}/", state.dir_name()))
+                    .and_then(|name| name.strip_suffix(".env"))
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
+    }
+
+    async fn remove(&self, state: QueueState, id: &str) -> Result<(), QueueError> {
+        let env = self.env_key(state, id);
+        let eml = self.eml_key(state, id);
+        if let Err(e) = self.store.delete(&env).await {
+            warn!(%id, "could not remove S3 .env: {}", e);
+        }
+        if let Err(e) = self.store.delete(&eml).await {
+            warn!(%id, "could not remove S3 .eml: {}", e);
+        }
+        Ok(())
+    }
+
+    async fn recover(&self) -> Result<RecoveryReport, QueueError> {
+        let mut report = RecoveryReport::default();
+        for state in [
+            QueueState::Incoming,
+            QueueState::Active,
+            QueueState::Deferred,
+            QueueState::Hold,
+            QueueState::Bounce,
+        ] {
+            let keys = self
+                .store
+                .list(&format!("queue/{}/", state.dir_name()))
+                .await?;
+            let mut envs = HashSet::new();
+            let mut emls = HashSet::new();
+            let prefix = format!("queue/{}/", state.dir_name());
+            for key in keys {
+                if let Some(name) = key.strip_prefix(&prefix) {
+                    if let Some(id) = name.strip_suffix(".env") {
+                        envs.insert(id.to_owned());
+                    } else if let Some(id) = name.strip_suffix(".eml") {
+                        emls.insert(id.to_owned());
+                    }
+                }
+            }
+            for id in &emls {
+                if !envs.contains(id) {
+                    warn!(%id, dir = state.dir_name(), "orphan S3 body removed during recovery");
+                    let _ = self.store.delete(&self.eml_key(state, id)).await;
+                    report.orphan_bodies_removed += 1;
+                }
+            }
+            for id in &envs {
+                if !emls.contains(id) {
+                    warn!(%id, dir = state.dir_name(), "S3 envelope without body, quarantining");
+                    if let Ok(env) = self.store.get(&self.env_key(state, id)).await {
+                        let _ = self
+                            .store
+                            .put(&self.env_key(QueueState::Corrupt, id), env)
+                            .await;
+                        let _ = self.store.delete(&self.env_key(state, id)).await;
+                    }
+                    report.corrupt_envelopes += 1;
+                }
+            }
+        }
+        info!(
+            orphan_bodies = report.orphan_bodies_removed,
+            corrupt = report.corrupt_envelopes,
+            "S3 queue recovery complete"
+        );
+        Ok(report)
+    }
+}
+
+fn is_not_found(error: &str) -> bool {
+    error.contains("NoSuchKey")
+        || error.contains("NotFound")
+        || error.contains("404")
+        || error.contains("not found")
 }
 
 /// Result of a [`Queue::recover`] sweep.

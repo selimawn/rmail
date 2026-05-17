@@ -2299,7 +2299,9 @@ dependencies = [
 name = "rmail-mailbox"
 version = "0.1.0"
 dependencies = [
+ "rmail-config",
  "rmail-core",
+ "rmail-storage",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2310,7 +2312,9 @@ name = "rmail-queue"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "rmail-config",
  "rmail-core",
+ "rmail-storage",
  "serde",
  "thiserror 1.0.69",
  "tokio",

@@ -1,3 +1,6 @@
+# WARNING
+Never really been used in production. Respects the majority of conventions but may be fallible. Make sure to do tests and do not hesitate to make a fork or a pull request.
+
 # rmail
 
 A mail engine written 100% in Rust. Receives and sends email — like Postfix, but modern async Rust.

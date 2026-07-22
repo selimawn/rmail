@@ -58,12 +58,28 @@ async fn main() -> Result<()> {
 
     info!("shared state initialised");
 
+    // Wakes the queue manager as soon as a message is enqueued.
+    let notify = Arc::new(tokio::sync::Notify::new());
+
     // Spawn all tasks
     let smtp_task = {
-        let (config, queue, tls) = (Arc::clone(&config), Arc::clone(&queue), Arc::clone(&tls));
+        let (config, queue, tls, resolver, notify) = (
+            Arc::clone(&config),
+            Arc::clone(&queue),
+            Arc::clone(&tls),
+            Arc::clone(&resolver),
+            Arc::clone(&notify),
+        );
         tokio::spawn(async move {
-            rmail_server::smtp_listener::run(config.server.listen_smtp.clone(), config, queue, tls)
-                .await
+            rmail_server::smtp_listener::run(
+                config.server.listen_smtp.clone(),
+                config,
+                queue,
+                tls,
+                resolver,
+                notify,
+            )
+            .await
         })
     };
 
@@ -88,7 +104,7 @@ async fn main() -> Result<()> {
             Arc::clone(&resolver),
         );
         tokio::spawn(async move {
-            rmail_server::queue_manager::run(config, queue, maildir, resolver).await
+            rmail_server::queue_manager::run(config, queue, maildir, resolver, notify).await
         })
     };
 

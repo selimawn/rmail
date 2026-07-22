@@ -3,25 +3,30 @@
 //! Binds the configured TCP ports, accepts connections, and drives the
 //! `smtp::Session` state machine for each one.
 
+use crate::connlimit::PerIpLimiter;
 use anyhow::Result;
+use rmail_auth::fcrdns::FcrdnsResult;
 use rmail_config::Config;
 use rmail_core::Envelope;
+use rmail_dns::Resolver;
 use rmail_queue::Queue;
 use rmail_smtp::reply::Reply;
 use rmail_smtp::session::{Action, Session};
 use rmail_tls::TlsAcceptor;
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 /// Maximum simultaneous inbound SMTP connections.
 const MAX_CONNECTIONS: usize = 1024;
+/// Maximum number of sessions simultaneously accumulating a DATA body in
+/// memory. Bounds worst-case RAM usage to MAX_DATA_BODIES × max_message_mb.
+const MAX_DATA_BODIES: usize = 32;
 const MAX_SMTP_LINE: usize = 1000;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,19 +36,25 @@ pub async fn run(
     config: Arc<Config>,
     queue: Arc<Queue>,
     tls: Arc<TlsAcceptor>,
+    resolver: Arc<Resolver>,
+    notify: Arc<Notify>,
 ) -> Result<()> {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let per_ip = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+    let data_sem = Arc::new(Semaphore::new(MAX_DATA_BODIES));
+    let per_ip = PerIpLimiter::new();
     let mut tasks = Vec::new();
 
     for addr in addrs {
         let config = Arc::clone(&config);
         let queue = Arc::clone(&queue);
         let tls = Arc::clone(&tls);
+        let resolver = Arc::clone(&resolver);
+        let notify = Arc::clone(&notify);
         let sem = Arc::clone(&sem);
-        let per_ip = Arc::clone(&per_ip);
+        let data_sem = Arc::clone(&data_sem);
+        let per_ip = per_ip.clone();
         tasks.push(tokio::spawn(async move {
-            accept_loop(addr, config, queue, tls, sem, per_ip).await
+            accept_loop(addr, config, queue, tls, resolver, notify, sem, data_sem, per_ip).await
         }));
     }
 
@@ -53,34 +64,53 @@ pub async fn run(
     Ok(())
 }
 
+struct Ctx {
+    config: Arc<Config>,
+    queue: Arc<Queue>,
+    tls: Arc<TlsAcceptor>,
+    resolver: Arc<Resolver>,
+    notify: Arc<Notify>,
+    data_sem: Arc<Semaphore>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     addr: SocketAddr,
     config: Arc<Config>,
     queue: Arc<Queue>,
     tls: Arc<TlsAcceptor>,
+    resolver: Arc<Resolver>,
+    notify: Arc<Notify>,
     sem: Arc<Semaphore>,
-    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    data_sem: Arc<Semaphore>,
+    per_ip: PerIpLimiter,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "SMTP listening");
     loop {
         let (stream, peer) = listener.accept().await?;
         let permit = Arc::clone(&sem).acquire_owned().await.unwrap();
-        let config = Arc::clone(&config);
-        let queue = Arc::clone(&queue);
-        let tls = Arc::clone(&tls);
-        let per_ip = Arc::clone(&per_ip);
+        let ctx = Ctx {
+            config: Arc::clone(&config),
+            queue: Arc::clone(&queue),
+            tls: Arc::clone(&tls),
+            resolver: Arc::clone(&resolver),
+            notify: Arc::clone(&notify),
+            data_sem: Arc::clone(&data_sem),
+        };
+        let per_ip = per_ip.clone();
         tokio::spawn(async move {
-            let Some(_ip_permit) =
-                IpConnectionPermit::acquire(peer.ip(), &config, per_ip, permit).await
+            let Some(_ip_permit) = per_ip
+                .acquire(peer.ip(), ctx.config.rate_limit.smtp_connections_per_ip, permit)
+                .await
             else {
                 warn!(peer = %peer, "SMTP per-IP connection limit exceeded");
                 return;
             };
             let result = if addr.port() == 465 {
-                handle_implicit_tls(stream, peer.ip(), config, queue, tls).await
+                handle_implicit_tls(stream, peer.ip(), ctx).await
             } else {
-                handle_plain(stream, peer.ip(), config, queue, tls).await
+                handle_plain(stream, peer.ip(), ctx).await
             };
             if let Err(e) = result {
                 warn!(peer = %peer, "SMTP session error: {}", e);
@@ -89,67 +119,45 @@ async fn accept_loop(
     }
 }
 
-struct IpConnectionPermit {
-    ip: IpAddr,
-    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    _global: OwnedSemaphorePermit,
+/// Bound concurrent DATA bodies: holds a semaphore permit while the session
+/// is in the DATA state.
+struct DataPermit {
+    sem: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
-impl IpConnectionPermit {
-    async fn acquire(
-        ip: IpAddr,
-        config: &Config,
-        counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
-        global: OwnedSemaphorePermit,
-    ) -> Option<Self> {
-        let mut counts_guard = counts.lock().await;
-        let count = counts_guard.entry(ip).or_default();
-        if *count >= config.rate_limit.smtp_connections_per_ip {
-            return None;
-        }
-        *count += 1;
-        drop(counts_guard);
-        Some(Self {
-            ip,
-            counts,
-            _global: global,
-        })
+impl DataPermit {
+    fn new(sem: Arc<Semaphore>) -> Self {
+        Self { sem, permit: None }
     }
-}
 
-impl Drop for IpConnectionPermit {
-    fn drop(&mut self) {
-        let ip = self.ip;
-        let counts = Arc::clone(&self.counts);
-        tokio::spawn(async move {
-            let mut counts = counts.lock().await;
-            if let Some(count) = counts.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    counts.remove(&ip);
-                }
+    async fn sync(&mut self, session: &Session) {
+        if session.in_data() {
+            if self.permit.is_none() {
+                self.permit = Arc::clone(&self.sem).acquire_owned().await.ok();
             }
-        });
+        } else {
+            self.permit = None;
+        }
     }
 }
 
 async fn handle_plain(
     stream: tokio::net::TcpStream,
-    peer_ip: std::net::IpAddr,
-    config: Arc<Config>,
-    queue: Arc<Queue>,
-    tls: Arc<TlsAcceptor>,
+    peer_ip: IpAddr,
+    ctx: Ctx,
 ) -> Result<()> {
-    let (mut session, banner) = Session::new(peer_ip, &config);
+    let (mut session, banner) = Session::new(peer_ip, &ctx.config);
     let mut io = BufReader::new(stream);
     write_all_timeout(&mut io, &banner).await?;
+    let mut data_permit = DataPermit::new(Arc::clone(&ctx.data_sem));
 
     loop {
         let Some(line) = read_line_limited(&mut io, MAX_SMTP_LINE).await? else {
             break;
         };
 
-        match session.step(&line, &config) {
+        match session.step(&line, &ctx.config) {
             Action::Reply(bytes) => {
                 if !bytes.is_empty() {
                     write_all_timeout(&mut io, &bytes).await?;
@@ -167,9 +175,9 @@ async fn handle_plain(
                 write_all_timeout(&mut io, &bytes).await?;
                 // Consume the underlying stream, upgrade to TLS, restart loop
                 let tcp = io.into_inner();
-                let tls_stream = tls.accept(tcp).await?;
+                let tls_stream = ctx.tls.accept(tcp).await?;
                 session.mark_tls_active();
-                return handle_tls(tls_stream, session, config, queue).await;
+                return handle_tls(tls_stream, session, ctx).await;
             }
             Action::Close(bytes) => {
                 write_all_timeout(&mut io, &bytes).await?;
@@ -180,68 +188,52 @@ async fn handle_plain(
                 body,
                 reply,
             } => {
-                let auth = authenticate_inbound(&envelope, &body, &config).await;
-                if auth.reject {
-                    let err = Reply::dmarc_reject().to_wire();
-                    write_all_timeout(&mut io, &err).await?;
+                data_permit.permit = None;
+                if !process_enqueue(*envelope, body, reply, &ctx, &mut io).await? {
                     continue;
-                }
-                let body = auth.prepend_headers(body);
-                match queue.enqueue(*envelope, &body).await {
-                    Ok(id) => {
-                        info!(%id, "queued");
-                        write_all_timeout(&mut io, &reply).await?;
-                    }
-                    Err(e) => {
-                        error!("queue error: {}", e);
-                        let err = Reply::insufficient_storage().to_wire();
-                        write_all_timeout(&mut io, &err).await?;
-                    }
                 }
             }
         }
+        data_permit.sync(&session).await;
     }
     Ok(())
 }
 
 async fn handle_implicit_tls(
     stream: tokio::net::TcpStream,
-    peer_ip: std::net::IpAddr,
-    config: Arc<Config>,
-    queue: Arc<Queue>,
-    tls: Arc<TlsAcceptor>,
+    peer_ip: IpAddr,
+    ctx: Ctx,
 ) -> Result<()> {
-    let tls_stream = tls.accept(stream).await?;
-    let (mut session, banner) = Session::new(peer_ip, &config);
+    let tls_stream = ctx.tls.accept(stream).await?;
+    let (mut session, banner) = Session::new(peer_ip, &ctx.config);
     session.mark_tls_active();
-    handle_tls_with_banner(tls_stream, session, config, queue, banner).await
+    handle_tls_with_banner(tls_stream, session, ctx, banner).await
 }
 
 async fn handle_tls(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     session: Session,
-    config: Arc<Config>,
-    queue: Arc<Queue>,
+    ctx: Ctx,
 ) -> Result<()> {
-    handle_tls_with_banner(stream, session, config, queue, Vec::new()).await
+    handle_tls_with_banner(stream, session, ctx, Vec::new()).await
 }
 
 async fn handle_tls_with_banner(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     mut session: Session,
-    config: Arc<Config>,
-    queue: Arc<Queue>,
+    ctx: Ctx,
     banner: Vec<u8>,
 ) -> Result<()> {
     let mut io = BufReader::new(stream);
     if !banner.is_empty() {
         write_all_timeout(&mut io, &banner).await?;
     }
+    let mut data_permit = DataPermit::new(Arc::clone(&ctx.data_sem));
     loop {
         let Some(line) = read_line_limited(&mut io, MAX_SMTP_LINE).await? else {
             break;
         };
-        match session.step(&line, &config) {
+        match session.step(&line, &ctx.config) {
             Action::Reply(bytes) => {
                 if !bytes.is_empty() {
                     write_all_timeout(&mut io, &bytes).await?;
@@ -256,32 +248,98 @@ async fn handle_tls_with_banner(
                 body,
                 reply,
             } => {
-                let auth = authenticate_inbound(&envelope, &body, &config).await;
-                if auth.reject {
-                    let err = Reply::dmarc_reject().to_wire();
-                    write_all_timeout(&mut io, &err).await?;
+                data_permit.permit = None;
+                if !process_enqueue(*envelope, body, reply, &ctx, &mut io).await? {
                     continue;
-                }
-                let body = auth.prepend_headers(body);
-                match queue.enqueue(*envelope, &body).await {
-                    Ok(_id) => {
-                        write_all_timeout(&mut io, &reply).await?;
-                    }
-                    Err(e) => {
-                        error!("queue error: {}", e);
-                        let err = Reply::insufficient_storage().to_wire();
-                        write_all_timeout(&mut io, &err).await?;
-                    }
                 }
             }
             Action::UpgradeTls(_) => {} // already TLS
         }
+        data_permit.sync(&session).await;
     }
     Ok(())
 }
 
+/// Run inbound authentication, prepend trace headers, enqueue the message.
+/// Returns false when the message was rejected (session continues).
+async fn process_enqueue<W: AsyncWrite + Unpin>(
+    mut envelope: Envelope,
+    body: Vec<u8>,
+    reply: Vec<u8>,
+    ctx: &Ctx,
+    io: &mut W,
+) -> Result<bool> {
+    let auth = authenticate_inbound(&envelope, &body, &ctx.config).await;
+    if auth.reject {
+        let err = Reply::dmarc_reject().to_wire();
+        write_all_timeout(io, &err).await?;
+        return Ok(false);
+    }
+    envelope.quarantine = auth.quarantine;
+
+    // Trace headers, in order: Received (with FCrDNS), Authentication-Results,
+    // Received-SPF. Inserted now — before the first on-disk write — so they
+    // can never be duplicated by retries.
+    let received = build_received(&envelope, &ctx.config.server.hostname, &ctx.resolver).await;
+    let body = auth.prepend_headers(received, body);
+
+    match ctx.queue.enqueue(envelope, &body).await {
+        Ok(id) => {
+            info!(%id, "queued");
+            ctx.notify.notify_one();
+            write_all_timeout(io, &reply).await?;
+        }
+        Err(e) => {
+            error!("queue error: {}", e);
+            let err = Reply::insufficient_storage().to_wire();
+            write_all_timeout(io, &err).await?;
+        }
+    }
+    Ok(true)
+}
+
+/// Build the `Received:` trace header per RFC 5321 §3.7.2. The parenthesised
+/// comment carries the forward-confirmed reverse DNS name when available.
+async fn build_received(
+    envelope: &Envelope,
+    our_hostname: &str,
+    resolver: &Resolver,
+) -> Vec<u8> {
+    let rdns = match rmail_auth::fcrdns::check(envelope.client_ip, resolver).await {
+        FcrdnsResult::Pass(name) => name,
+        _ => "unknown".to_owned(),
+    };
+    let ts = envelope
+        .received_at
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let first_rcpt = envelope
+        .recipients
+        .first()
+        .map(|r| r.address.to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+    let with = if envelope.auth_user.is_some() {
+        "ESMTPSA"
+    } else {
+        "ESMTP"
+    };
+    format!(
+        "Received: from {} ({} [{}])\r\n\tby {} (rmail) with {} id {}\r\n\tfor {}; {}\r\n",
+        envelope.client_helo,
+        rdns,
+        envelope.client_ip,
+        our_hostname,
+        with,
+        envelope.id,
+        first_rcpt,
+        ts,
+    )
+    .into_bytes()
+}
+
 struct InboundAuth {
     reject: bool,
+    quarantine: bool,
     authentication_results: Option<String>,
     received_spf: Option<String>,
 }
@@ -290,12 +348,13 @@ impl InboundAuth {
     fn pass() -> Self {
         Self {
             reject: false,
+            quarantine: false,
             authentication_results: None,
             received_spf: None,
         }
     }
 
-    fn prepend_headers(&self, body: Vec<u8>) -> Vec<u8> {
+    fn prepend_headers(&self, received: Vec<u8>, body: Vec<u8>) -> Vec<u8> {
         let extra_len = self
             .authentication_results
             .as_ref()
@@ -306,10 +365,8 @@ impl InboundAuth {
                 .as_ref()
                 .map(|h| h.len() + "Received-SPF: \r\n".len())
                 .unwrap_or(0);
-        if extra_len == 0 {
-            return body;
-        }
-        let mut out = Vec::with_capacity(extra_len + body.len());
+        let mut out = Vec::with_capacity(received.len() + extra_len + body.len());
+        out.extend_from_slice(&received);
         if let Some(header) = &self.authentication_results {
             out.extend_from_slice(b"Authentication-Results: ");
             out.extend_from_slice(header.as_bytes());
@@ -340,6 +397,7 @@ async fn authenticate_inbound(envelope: &Envelope, body: &[u8], config: &Config)
     )
     .await;
     let reject = results.should_reject().is_some();
+    let quarantine = !reject && results.should_quarantine();
     let received_spf = format!(
         "{} (rmail: domain of {} designates {} as permitted sender) client-ip={}; envelope-from={}; helo={}",
         results.spf.label(),
@@ -351,7 +409,10 @@ async fn authenticate_inbound(envelope: &Envelope, body: &[u8], config: &Config)
     );
     InboundAuth {
         reject,
-        authentication_results: Some(results.header(&config.server.hostname)),
+        quarantine,
+        authentication_results: Some(
+            results.header(&config.server.hostname, &envelope.from.domain),
+        ),
         received_spf: Some(received_spf),
     }
 }

@@ -30,6 +30,7 @@ backend     = "local"
 
 [rate_limit]
 smtp_connections_per_ip = 32
+imap_connections_per_ip = 32
 
 [outbound_tls]
 # require_starttls forces outbound SMTP delivery to fail if an MX does not

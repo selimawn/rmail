@@ -153,12 +153,64 @@ async fn outbound_tls_policy(
     policy
 }
 
+#[derive(Clone)]
 struct MtaStsPolicy {
     mode: String,
     mx: Vec<String>,
+    max_age: u64,
 }
 
+// ─── MTA-STS policy cache (RFC 8461 §5.1 requires honoring max_age) ───────
+
+struct StsCacheEntry {
+    fetched_at: std::time::Instant,
+    ttl: Duration,
+    policy: Option<MtaStsPolicy>,
+}
+
+fn sts_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, StsCacheEntry>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, StsCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// TTL for "this domain has no MTA-STS policy" negative results.
+const STS_NEGATIVE_TTL: Duration = Duration::from_secs(300);
+
 async fn fetch_mta_sts_policy(domain: &str, resolver: &Resolver) -> Option<MtaStsPolicy> {
+    {
+        let cache = sts_cache().lock().unwrap();
+        if let Some(entry) = cache.get(domain) {
+            if entry.fetched_at.elapsed() < entry.ttl {
+                return entry.policy.clone();
+            }
+        }
+    }
+
+    let policy = fetch_mta_sts_policy_uncached(domain, resolver).await;
+    let ttl = policy
+        .as_ref()
+        .map(|p| Duration::from_secs(p.max_age.clamp(60, 2_678_400)))
+        .unwrap_or(STS_NEGATIVE_TTL);
+    sts_cache().lock().unwrap().insert(
+        domain.to_owned(),
+        StsCacheEntry {
+            fetched_at: std::time::Instant::now(),
+            ttl,
+            policy: policy.as_ref().map(|p| MtaStsPolicy {
+                mode: p.mode.clone(),
+                mx: p.mx.clone(),
+                max_age: p.max_age,
+            }),
+        },
+    );
+    policy
+}
+
+async fn fetch_mta_sts_policy_uncached(domain: &str, resolver: &Resolver) -> Option<MtaStsPolicy> {
     let txt_name = format!("_mta-sts.{}", domain);
     let has_sts = resolver
         .txt(&txt_name)
@@ -183,6 +235,7 @@ async fn fetch_mta_sts_policy(domain: &str, resolver: &Resolver) -> Option<MtaSt
 fn parse_mta_sts_policy(body: &str) -> Option<MtaStsPolicy> {
     let mut mode = None;
     let mut mx = Vec::new();
+    let mut max_age = 86400u64;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -195,10 +248,19 @@ fn parse_mta_sts_policy(body: &str) -> Option<MtaStsPolicy> {
             "version" if value.trim() != "STSv1" => return None,
             "mode" => mode = Some(value.trim().to_ascii_lowercase()),
             "mx" => mx.push(value.trim().to_ascii_lowercase()),
+            "max_age" => {
+                if let Ok(v) = value.trim().parse::<u64>() {
+                    max_age = v;
+                }
+            }
             _ => {}
         }
     }
-    Some(MtaStsPolicy { mode: mode?, mx })
+    Some(MtaStsPolicy {
+        mode: mode?,
+        mx,
+        max_age,
+    })
 }
 
 fn mx_pattern_matches(pattern: &str, mx: &str) -> bool {

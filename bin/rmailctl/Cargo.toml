@@ -23,3 +23,6 @@ tracing-subscriber = { workspace = true }
 serde         = { workspace = true }
 serde_json    = "1"
 rpassword     = "7"
+base64        = { workspace = true }
+rsa           = "0.9"
+rand          = "0.8"

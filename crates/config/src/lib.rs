@@ -78,9 +78,15 @@ pub struct S3StorageConfig {
 pub struct RateLimitConfig {
     #[serde(default = "default_smtp_connections_per_ip")]
     pub smtp_connections_per_ip: usize,
+    #[serde(default = "default_imap_connections_per_ip")]
+    pub imap_connections_per_ip: usize,
 }
 
 fn default_smtp_connections_per_ip() -> usize {
+    32
+}
+
+fn default_imap_connections_per_ip() -> usize {
     32
 }
 
@@ -88,6 +94,7 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             smtp_connections_per_ip: default_smtp_connections_per_ip(),
+            imap_connections_per_ip: default_imap_connections_per_ip(),
         }
     }
 }
@@ -222,9 +229,11 @@ impl Config {
                 "server.max_message_mb must be greater than zero".into(),
             ));
         }
-        if self.rate_limit.smtp_connections_per_ip == 0 {
+        if self.rate_limit.smtp_connections_per_ip == 0
+            || self.rate_limit.imap_connections_per_ip == 0
+        {
             return Err(ConfigError::Validation(
-                "rate_limit.smtp_connections_per_ip must be greater than zero".into(),
+                "rate_limit connections_per_ip values must be greater than zero".into(),
             ));
         }
         if self.storage.backend == StorageBackend::S3 && self.storage.s3.is_none() {

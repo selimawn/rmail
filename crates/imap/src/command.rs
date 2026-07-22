@@ -8,7 +8,10 @@ pub enum Command {
     Noop,
     Logout,
     StartTls,
-    Authenticate(String),
+    Authenticate {
+        mech: String,
+        initial: Option<String>,
+    },
     Login {
         username: String,
         password: String,
@@ -135,7 +138,16 @@ pub fn parse(line: &str) -> Result<(String, Command), ParseError> {
         "NOOP" => Command::Noop,
         "LOGOUT" => Command::Logout,
         "STARTTLS" => Command::StartTls,
-        "AUTHENTICATE" => Command::Authenticate(rest.trim().to_owned()),
+        "AUTHENTICATE" => {
+            let mut tokens = rest.splitn(2, ' ');
+            let mech = tokens.next().unwrap_or("").to_owned();
+            let initial = tokens
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            Command::Authenticate { mech, initial }
+        }
         "LOGIN" => {
             let (username, password) = parse_login_args(rest)?;
             Command::Login { username, password }

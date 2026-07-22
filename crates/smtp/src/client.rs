@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_REPLY_LINE: usize = 8192;
@@ -54,6 +54,11 @@ pub struct DeliveryOutcome {
 
 /// Deliver a single message to a remote MTA.
 /// `remote_domain` is the MX hostname used for STARTTLS SNI.
+///
+/// Opportunistic mode (`require_starttls = false`): certificate verification
+/// is disabled (Postfix `may` semantics — many MTAs use self-signed certs)
+/// and any STARTTLS failure falls back to a fresh plaintext connection.
+/// Strict mode: a verified TLS session is mandatory.
 pub async fn deliver(
     target: SocketAddr,
     envelope: &Envelope,
@@ -64,44 +69,29 @@ pub async fn deliver(
     require_starttls: bool,
 ) -> Result<DeliveryOutcome, ClientError> {
     debug!(%target, id = %envelope.id, "connecting");
-    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
-    let mut io = BufReader::new(stream);
-
-    // Banner
-    let banner = read_reply(&mut io).await?;
-    if banner.code != 220 {
-        return Err(ClientError::Smtp {
-            code: banner.code,
-            message: banner.message,
-        });
-    }
-
-    // EHLO
-    let ehlo = send_recv(&mut io, &format!("EHLO {}\r\n", our_hostname)).await?;
-    if ehlo.code != 250 {
-        return Err(ClientError::Smtp {
-            code: ehlo.code,
-            message: ehlo.message,
-        });
-    }
+    let mut io = connect_and_ehlo(target, our_hostname).await?;
 
     // Check for STARTTLS capability in EHLO response
-    let has_starttls = ehlo
-        .message
+    let has_starttls = io
+        .1
         .lines()
         .any(|l| l.trim().eq_ignore_ascii_case("starttls"));
 
     if has_starttls {
-        let r = send_recv(&mut io, "STARTTLS\r\n").await?;
+        let r = send_recv(&mut io.0, "STARTTLS\r\n").await?;
         if r.code == 220 {
-            let connector = TlsConnector::new();
-            let plain = io.into_inner();
-            match connector
-                .connect(remote_domain, plain, TlsMode::Opportunistic)
-                .await
-            {
+            let connector = if require_starttls {
+                TlsConnector::new()
+            } else {
+                TlsConnector::permissive()
+            };
+            let mode = if require_starttls {
+                TlsMode::Required
+            } else {
+                TlsMode::Opportunistic
+            };
+            let plain = io.0.into_inner();
+            match connector.connect(remote_domain, plain, mode).await {
                 Ok(Some(tls_stream)) => {
                     debug!(%remote_domain, "STARTTLS established");
                     let mut tls_io = BufReader::new(tls_stream);
@@ -116,26 +106,61 @@ pub async fn deliver(
                     }
                     return deliver_inner(&mut tls_io, envelope, recipients, body).await;
                 }
-                Ok(None) => {
-                    warn!(%remote_domain, "STARTTLS failed, falling back to plaintext");
-                    return Err(ClientError::Tls(
-                        "STARTTLS fallback requires reconnect".into(),
-                    ));
-                }
-                Err(e) => {
-                    warn!(%remote_domain, "STARTTLS handshake failed: {}", e);
-                    return Err(ClientError::Tls(e.to_string()));
+                outcome => {
+                    if require_starttls {
+                        let msg = match outcome {
+                            Ok(None) => "STARTTLS failed".to_owned(),
+                            Err(e) => format!("STARTTLS handshake failed: {}", e),
+                            _ => unreachable!(),
+                        };
+                        warn!(%remote_domain, "{}", msg);
+                        return Err(ClientError::Tls(msg));
+                    }
+                    // Opportunistic: reconnect and deliver in plaintext.
+                    warn!(%remote_domain, "STARTTLS failed, retrying in plaintext");
+                    let mut plain_io = connect_and_ehlo(target, our_hostname).await?;
+                    return deliver_inner(&mut plain_io.0, envelope, recipients, body).await;
                 }
             }
         }
-    } else if require_starttls {
+    }
+    if require_starttls {
         return Err(ClientError::Tls(format!(
             "{} did not advertise STARTTLS",
             remote_domain
         )));
     }
 
-    deliver_inner(&mut io, envelope, recipients, body).await
+    deliver_inner(&mut io.0, envelope, recipients, body).await
+}
+
+/// Open a TCP connection, read the banner, send EHLO.
+/// Returns the buffered stream and the EHLO reply text (for capability checks).
+async fn connect_and_ehlo(
+    target: SocketAddr,
+    our_hostname: &str,
+) -> Result<(BufReader<TcpStream>, String), ClientError> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+    let mut io = BufReader::new(stream);
+
+    let banner = read_reply(&mut io).await?;
+    if banner.code != 220 {
+        return Err(ClientError::Smtp {
+            code: banner.code,
+            message: banner.message,
+        });
+    }
+
+    let ehlo = send_recv(&mut io, &format!("EHLO {}\r\n", our_hostname)).await?;
+    if ehlo.code != 250 {
+        return Err(ClientError::Smtp {
+            code: ehlo.code,
+            message: ehlo.message,
+        });
+    }
+    Ok((io, ehlo.message))
 }
 
 async fn deliver_inner<S>(

@@ -11,9 +11,14 @@ pub async fn generate(original: &Envelope, reason: &str, queue: &Queue, server_h
         return;
     }
 
+    let date = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap_or_else(|_| "unknown".to_owned());
     let dsn_body = format!(
         "From: MAILER-DAEMON <mailer-daemon@{host}>\r\n\
          To: {sender}\r\n\
+         Date: {date}\r\n\
+         Message-ID: <{msg_id}@{host}>\r\n\
          Subject: Delivery Status Notification (Failure)\r\n\
          Auto-Submitted: auto-replied\r\n\
          \r\n\
@@ -25,6 +30,8 @@ pub async fn generate(original: &Envelope, reason: &str, queue: &Queue, server_h
          Original message ID: {id}\r\n",
         host = server_hostname,
         sender = original.from.as_str(),
+        date = date,
+        msg_id = rmail_core::QueueId::generate(),
         reason = reason,
         id = original.id,
     );

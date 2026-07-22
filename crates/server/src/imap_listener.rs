@@ -1,5 +1,6 @@
 //! Inbound IMAP listener.
 
+use crate::connlimit::PerIpLimiter;
 use anyhow::Result;
 use rmail_config::Config;
 use rmail_imap::session::{Action, Session};
@@ -19,7 +20,9 @@ use tracing::{info, warn};
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_IMAP_LINE: usize = 8192;
 const MAX_IMAP_LITERAL: usize = 50 * 1024 * 1024;
-const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Must comfortably exceed the 29-minute IDLE window recommended by RFC 2177,
+/// otherwise IDLE clients are kicked off mid-idle.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(1860);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn run(
@@ -29,14 +32,16 @@ pub async fn run(
     tls: Arc<TlsAcceptor>,
 ) -> Result<()> {
     let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip = PerIpLimiter::new();
     let mut tasks = Vec::new();
     for addr in addrs {
         let config = Arc::clone(&config);
         let maildir = Arc::clone(&maildir);
         let tls = Arc::clone(&tls);
         let sem = Arc::clone(&sem);
+        let per_ip = per_ip.clone();
         tasks.push(tokio::spawn(async move {
-            accept_loop(addr, config, maildir, tls, sem).await
+            accept_loop(addr, config, maildir, tls, sem, per_ip).await
         }));
     }
     for t in tasks {
@@ -51,6 +56,7 @@ async fn accept_loop(
     maildir: Arc<Maildir>,
     tls: Arc<TlsAcceptor>,
     sem: Arc<Semaphore>,
+    per_ip: PerIpLimiter,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "IMAP listening");
@@ -60,8 +66,19 @@ async fn accept_loop(
         let config = Arc::clone(&config);
         let maildir = Arc::clone(&maildir);
         let tls = Arc::clone(&tls);
+        let per_ip = per_ip.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            let Some(_ip_permit) = per_ip
+                .acquire(
+                    peer.ip(),
+                    config.rate_limit.imap_connections_per_ip,
+                    permit,
+                )
+                .await
+            else {
+                warn!(peer = %peer, "IMAP per-IP connection limit exceeded");
+                return;
+            };
             let result = if addr.port() == 993 {
                 handle_implicit_tls(stream, config, maildir, tls).await
             } else {

@@ -8,4 +8,3 @@ hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-ru
 tokio     = { workspace = true }
 tracing   = { workspace = true }
 thiserror = { workspace = true }
-serde     = { workspace = true }

@@ -22,6 +22,10 @@ pub struct Session {
     selected: Option<String>,
     read_only: bool,
     tls_active: bool,
+    /// Tag of the in-progress IDLE command (waiting for DONE).
+    idle_tag: Option<String>,
+    /// Tag of the in-progress AUTHENTICATE command (waiting for the SASL blob).
+    pending_auth_tag: Option<String>,
 }
 
 pub enum Action {
@@ -38,6 +42,44 @@ struct StoreRequest<'a> {
     silent: bool,
 }
 
+/// Redacted command name for logs — never leaks credentials or payloads.
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Capability => "CAPABILITY",
+        Command::Noop => "NOOP",
+        Command::Logout => "LOGOUT",
+        Command::StartTls => "STARTTLS",
+        Command::Authenticate { .. } => "AUTHENTICATE",
+        Command::Login { .. } => "LOGIN",
+        Command::Select(_) => "SELECT",
+        Command::Examine(_) => "EXAMINE",
+        Command::List { .. } => "LIST",
+        Command::Lsub { .. } => "LSUB",
+        Command::Status { .. } => "STATUS",
+        Command::Fetch { .. } => "FETCH",
+        Command::Store { .. } => "STORE",
+        Command::Expunge => "EXPUNGE",
+        Command::Append { .. } => "APPEND",
+        Command::Copy { .. } => "COPY",
+        Command::Move { .. } => "MOVE",
+        Command::Create(_) => "CREATE",
+        Command::Delete(_) => "DELETE",
+        Command::Rename { .. } => "RENAME",
+        Command::Subscribe(_) => "SUBSCRIBE",
+        Command::Unsubscribe(_) => "UNSUBSCRIBE",
+        Command::UidFetch { .. } => "UID FETCH",
+        Command::UidStore { .. } => "UID STORE",
+        Command::UidCopy { .. } => "UID COPY",
+        Command::UidMove { .. } => "UID MOVE",
+        Command::UidExpunge(_) => "UID EXPUNGE",
+        Command::Search(_) => "SEARCH",
+        Command::Close => "CLOSE",
+        Command::Unselect => "UNSELECT",
+        Command::Idle => "IDLE",
+        Command::Done => "DONE",
+    }
+}
+
 impl Session {
     pub fn new(tls_active: bool) -> (Self, Vec<u8>) {
         let greeting = Response::untagged(format!(
@@ -52,6 +94,8 @@ impl Session {
                 selected: None,
                 read_only: false,
                 tls_active,
+                idle_tag: None,
+                pending_auth_tag: None,
             },
             greeting,
         )
@@ -59,14 +103,23 @@ impl Session {
 
     /// Feed one command line. Returns bytes to send to the client.
     pub async fn step(&mut self, line: &[u8], config: &Config, maildir: &Maildir) -> Action {
+        // A SASL continuation line (base64 credentials) is expected.
+        if let Some(tag) = self.pending_auth_tag.take() {
+            return Action::Reply(self.finish_authenticate(&tag, line, config));
+        }
+
         let (command_line, literal) = split_literal_command(line);
         let line_str = match std::str::from_utf8(command_line) {
             Ok(s) => s.trim_end_matches(['\r', '\n']),
             Err(_) => return Action::Reply(Response::bad("*", "BAD Non-UTF8 input").to_wire()),
         };
 
+        // DONE terminates the in-progress IDLE with the IDLE command's tag.
         if line_str.eq_ignore_ascii_case("DONE") {
-            return Action::Reply(Response::untagged("OK IDLE terminated").to_wire());
+            return match self.idle_tag.take() {
+                Some(tag) => Action::Reply(Response::ok(&tag, "IDLE terminated").to_wire()),
+                None => Action::Reply(Response::bad("*", "BAD DONE without IDLE").to_wire()),
+            };
         }
 
         let (tag, mut cmd) = match command::parse(line_str) {
@@ -79,7 +132,7 @@ impl Session {
             *dst = src.to_vec();
         }
 
-        debug!(state = ?self.state, ?cmd, "IMAP command");
+        debug!(cmd = command_name(&cmd), "IMAP command");
         self.dispatch(&tag, cmd, config, maildir).await
     }
 
@@ -115,7 +168,9 @@ impl Session {
                     Action::UpgradeTls(Response::ok(tag, "Begin TLS negotiation now").to_wire())
                 }
             }
-            Command::Authenticate(mech) => Action::Reply(self.do_authenticate(tag, &mech)),
+            Command::Authenticate { mech, initial } => {
+                Action::Reply(self.do_authenticate(tag, &mech, initial.as_deref(), config))
+            }
             Command::Login { username, password } => {
                 Action::Reply(self.do_login(tag, &username, &password, config))
             }
@@ -175,7 +230,7 @@ impl Session {
                 .await,
             ),
             Command::Expunge | Command::UidExpunge(_) => {
-                Action::Reply(self.do_expunge(tag, maildir).await)
+                Action::Reply(self.do_expunge(tag, maildir, "EXPUNGE completed").await)
             }
             Command::Close | Command::Unselect => {
                 self.selected = None;
@@ -183,7 +238,14 @@ impl Session {
                 self.state = State::Authenticated;
                 Action::Reply(Response::ok(tag, "CLOSE completed").to_wire())
             }
-            Command::Idle => Action::Reply(b"+ idling\r\n".to_vec()),
+            Command::Idle => {
+                if self.state < State::Authenticated {
+                    Action::Reply(Response::no(tag, "NO Not authenticated").to_wire())
+                } else {
+                    self.idle_tag = Some(tag.to_owned());
+                    Action::Reply(b"+ idling\r\n".to_vec())
+                }
+            }
             Command::Search(criteria) => {
                 Action::Reply(self.do_search(tag, &criteria, maildir).await)
             }
@@ -232,27 +294,94 @@ impl Session {
         if !self.tls_active {
             return Response::no(tag, "NO [PRIVACYREQUIRED] STARTTLS required").to_wire();
         }
-        if let Some(user) = config.find_user(username) {
-            if rmail_auth::password::verify(password, &user.password_hash) {
-                let addr = Address::parse(username).unwrap_or_else(|_| Address::null());
-                self.user = Some(addr);
-                self.state = State::Authenticated;
-                info!(%username, "IMAP login");
-                return Response::ok(tag, "LOGIN completed").to_wire();
-            }
+        if self.verify_credentials(username, password, config) {
+            info!(%username, "IMAP login");
+            return Response::ok(tag, "LOGIN completed").to_wire();
         }
         warn!(%username, "IMAP login failed");
         Response::no(tag, "NO [AUTHENTICATIONFAILED] Invalid credentials").to_wire()
     }
 
-    fn do_authenticate(&self, tag: &str, mech: &str) -> Vec<u8> {
+    /// Verify credentials and, on success, switch to Authenticated state.
+    /// Unknown users are verified against a dummy hash so failures cost the
+    /// same time — prevents user enumeration via timing.
+    fn verify_credentials(&mut self, username: &str, password: &str, config: &Config) -> bool {
+        let cfg_user = config.find_user(username);
+        let hash = cfg_user
+            .map(|u| u.password_hash.as_str())
+            .unwrap_or_else(|| rmail_auth::password::dummy_hash());
+        if !rmail_auth::password::verify(password, hash) || cfg_user.is_none() {
+            return false;
+        }
+        let addr = Address::parse(username).unwrap_or_else(|_| Address::null());
+        self.user = Some(addr);
+        self.state = State::Authenticated;
+        true
+    }
+
+    fn do_authenticate(
+        &mut self,
+        tag: &str,
+        mech: &str,
+        initial: Option<&str>,
+        config: &Config,
+    ) -> Vec<u8> {
+        if self.state != State::NotAuthenticated {
+            return Response::bad(tag, "BAD Already authenticated").to_wire();
+        }
+        if !self.tls_active {
+            return Response::no(tag, "NO [PRIVACYREQUIRED] STARTTLS required").to_wire();
+        }
         match mech.to_ascii_uppercase().as_str() {
-            "PLAIN" | "LOGIN" => Response::no(
-                tag,
-                "NO Use LOGIN; SASL challenge flow is not enabled in this listener",
-            )
-            .to_wire(),
+            "PLAIN" => match initial {
+                Some(blob) => self.authenticate_plain(tag, blob, config),
+                None => {
+                    self.pending_auth_tag = Some(tag.to_owned());
+                    b"+ \r\n".to_vec()
+                }
+            },
             _ => Response::no(tag, "NO Unsupported authentication mechanism").to_wire(),
+        }
+    }
+
+    fn finish_authenticate(&mut self, tag: &str, line: &[u8], config: &Config) -> Vec<u8> {
+        let blob = std::str::from_utf8(line).unwrap_or("").trim();
+        if blob == "*" {
+            return Response::bad(tag, "BAD Authentication aborted").to_wire();
+        }
+        self.authenticate_plain(tag, blob, config)
+    }
+
+    /// Verify a SASL PLAIN blob (`\0user\0password`, base64-encoded).
+    fn authenticate_plain(&mut self, tag: &str, blob: &str, config: &Config) -> Vec<u8> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let creds = B64
+            .decode(blob)
+            .ok()
+            .and_then(|raw| {
+                let parts: Vec<&[u8]> = raw.splitn(3, |&b| b == 0).collect();
+                if parts.len() < 3 {
+                    return None;
+                }
+                let authzid = std::str::from_utf8(parts[0]).ok()?.to_owned();
+                let user = std::str::from_utf8(parts[1]).ok()?.to_owned();
+                let pass = std::str::from_utf8(parts[2]).ok()?.to_owned();
+                Some((authzid, user, pass))
+            });
+        let Some((authzid, user, pass)) = creds else {
+            return Response::no(tag, "NO [AUTHENTICATIONFAILED] Invalid credentials").to_wire();
+        };
+        if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&user) {
+            // Burn the hash time anyway to avoid leaking which check failed.
+            let _ = rmail_auth::password::verify(&pass, rmail_auth::password::dummy_hash());
+            return Response::no(tag, "NO [AUTHORIZATIONFAILED] Not authorized").to_wire();
+        }
+        if self.verify_credentials(&user, &pass, config) {
+            info!(%user, "IMAP AUTHENTICATE PLAIN success");
+            Response::ok(tag, "AUTHENTICATE completed").to_wire()
+        } else {
+            warn!(%user, "IMAP AUTHENTICATE PLAIN failed");
+            Response::no(tag, "NO [AUTHENTICATIONFAILED] Invalid credentials").to_wire()
         }
     }
 
@@ -273,19 +402,32 @@ impl Session {
             None => return Response::no(tag, "NO Not authenticated").to_wire(),
         };
 
-        let entries = match maildir.list_messages(&user, mailbox).await {
-            Ok(e) => e,
+        let mut listing = match maildir.list_messages(&user, mailbox).await {
+            Ok(l) => l,
             Err(_) => return Response::no(tag, "NO Mailbox does not exist").to_wire(),
         };
 
-        let exists = entries.len();
-        let recent = entries.iter().filter(|e| !e.seen && !e.deleted).count();
-        let unseen = entries
+        let exists = listing.entries.len();
+        let recent = listing.entries.iter().filter(|e| e.recent).count();
+        let unseen = listing
+            .entries
             .iter()
             .position(|e| !e.seen)
             .map(|i| i + 1)
             .unwrap_or(0);
-        let uid_next = next_uid(&entries);
+
+        // SELECT (read-write) moves new/ → cur/: messages lose \Recent but
+        // keep their flags and UIDs. EXAMINE leaves the mailbox untouched.
+        if !read_only {
+            for entry in listing.entries.iter_mut() {
+                if entry.recent {
+                    if let Ok(new_path) = maildir.move_to_cur(&entry.path).await {
+                        entry.path = new_path;
+                        entry.recent = false;
+                    }
+                }
+            }
+        }
 
         self.selected = Some(mailbox.to_owned());
         self.read_only = read_only;
@@ -301,12 +443,16 @@ impl Session {
             out.extend(Response::ok("*", format!("[UNSEEN {}] first unseen", unseen)).to_wire());
         }
         out.extend(
-            Response::ok("*", format!("[UIDNEXT {}] predicted next UID", uid_next)).to_wire(),
+            Response::ok(
+                "*",
+                format!("[UIDNEXT {}] predicted next UID", listing.uid_next),
+            )
+            .to_wire(),
         );
         out.extend(
             Response::ok(
                 "*",
-                format!("[UIDVALIDITY {}] UIDs valid", uid_validity(&user, mailbox)),
+                format!("[UIDVALIDITY {}] UIDs valid", listing.uid_validity),
             )
             .to_wire(),
         );
@@ -370,23 +516,26 @@ impl Session {
             None => return Response::no(tag, "NO Not authenticated").to_wire(),
         };
 
-        let entries = maildir
+        let listing = maildir
             .list_messages(&user, mailbox)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| rmail_mailbox::FolderListing {
+                entries: Vec::new(),
+                uid_validity: 1,
+                uid_next: 1,
+            });
+        let entries = &listing.entries;
         let messages = entries.len();
         let unseen = entries.iter().filter(|e| !e.seen).count();
-        let recent = entries.iter().filter(|e| !e.seen && !e.deleted).count();
-        let uid_next = next_uid(&entries);
-        let uid_validity = uid_validity(&user, mailbox);
+        let recent = entries.iter().filter(|e| e.recent).count();
 
         let parts: Vec<String> = items
             .iter()
             .map(|i| match i {
                 StatusItem::Messages => format!("MESSAGES {}", messages),
                 StatusItem::Recent => format!("RECENT {}", recent),
-                StatusItem::UidNext => format!("UIDNEXT {}", uid_next),
-                StatusItem::UidValidity => format!("UIDVALIDITY {}", uid_validity),
+                StatusItem::UidNext => format!("UIDNEXT {}", listing.uid_next),
+                StatusItem::UidValidity => format!("UIDVALIDITY {}", listing.uid_validity),
                 StatusItem::Unseen => format!("UNSEEN {}", unseen),
             })
             .collect();
@@ -418,7 +567,7 @@ impl Session {
         };
 
         let entries = match maildir.list_messages(&user, &folder).await {
-            Ok(e) => e,
+            Ok(l) => l.entries,
             Err(e) => {
                 warn!("FETCH list_messages error: {}", e);
                 return Response::no(tag, "NO Internal error").to_wire();
@@ -466,12 +615,10 @@ impl Session {
                         parts.push(format!("RFC822.SIZE {}", entry.size).into_bytes());
                     }
                     FetchItem::Uid => {
-                        parts.push(
-                            format!("UID {}", uid_for_filename(&entry.filename)).into_bytes(),
-                        );
+                        parts.push(format!("UID {}", entry.uid).into_bytes());
                     }
                     FetchItem::InternalDate => {
-                        let date = internal_date(entry).await;
+                        let date = internal_date(entry);
                         parts.push(format!("INTERNALDATE \"{}\"", date).into_bytes());
                     }
                     FetchItem::Rfc822 | FetchItem::Body | FetchItem::BodyPeek(_) => {
@@ -549,7 +696,7 @@ impl Session {
         };
 
         let entries = match maildir.list_messages(&user, &folder).await {
-            Ok(e) => e,
+            Ok(l) => l.entries,
             Err(_) => return Response::no(tag, "NO Internal error").to_wire(),
         };
 
@@ -649,7 +796,7 @@ impl Session {
             _ => return Response::no(tag, "NO Not selected").to_wire(),
         };
         let entries = match maildir.list_messages(&user, &folder).await {
-            Ok(e) => e,
+            Ok(l) => l.entries,
             Err(_) => return Response::no(tag, "NO Internal error").to_wire(),
         };
         let indices = if uid {
@@ -668,7 +815,7 @@ impl Session {
             }
         }
         if move_after_copy {
-            self.do_expunge(tag, maildir).await
+            self.do_expunge(tag, maildir, "MOVE completed").await
         } else {
             Response::ok(tag, "COPY completed").to_wire()
         }
@@ -706,7 +853,7 @@ impl Session {
 
     // ─── EXPUNGE ─────────────────────────────────────────────────────────────
 
-    async fn do_expunge(&mut self, tag: &str, maildir: &Maildir) -> Vec<u8> {
+    async fn do_expunge(&mut self, tag: &str, maildir: &Maildir, completed: &str) -> Vec<u8> {
         if self.state != State::Selected {
             return Response::no(tag, "NO No mailbox selected").to_wire();
         }
@@ -716,7 +863,7 @@ impl Session {
         };
 
         let entries = match maildir.list_messages(&user, &folder).await {
-            Ok(e) => e,
+            Ok(l) => l.entries,
             Err(_) => return Response::no(tag, "NO Internal error").to_wire(),
         };
 
@@ -733,7 +880,7 @@ impl Session {
             }
         }
 
-        out.extend(Response::ok(tag, "EXPUNGE completed").to_wire());
+        out.extend(Response::ok(tag, completed).to_wire());
         out
     }
 
@@ -751,6 +898,7 @@ impl Session {
         let entries = maildir
             .list_messages(&user, &folder)
             .await
+            .map(|l| l.entries)
             .unwrap_or_default();
         let criteria = tokenize_search(criteria);
 
@@ -782,6 +930,8 @@ impl Session {
         self.state = State::NotAuthenticated;
         self.user = None;
         self.selected = None;
+        self.idle_tag = None;
+        self.pending_auth_tag = None;
     }
 }
 
@@ -840,11 +990,7 @@ fn parse_uid_set(seq: &str, entries: &[rmail_mailbox::MaildirEntry]) -> Vec<usiz
     if entries.is_empty() {
         return vec![];
     }
-    let max_uid = entries
-        .iter()
-        .map(|e| uid_for_filename(&e.filename))
-        .max()
-        .unwrap_or(1);
+    let max_uid = entries.iter().map(|e| e.uid).max().unwrap_or(1);
     let mut result = std::collections::BTreeSet::new();
     for part in seq.split(',') {
         if let Some((start, end)) = part.split_once(':') {
@@ -853,15 +999,14 @@ fn parse_uid_set(seq: &str, entries: &[rmail_mailbox::MaildirEntry]) -> Vec<usiz
             let lo = s.min(e);
             let hi = s.max(e);
             for (idx, entry) in entries.iter().enumerate() {
-                let uid = uid_for_filename(&entry.filename);
-                if uid >= lo && uid <= hi {
+                if entry.uid >= lo && entry.uid <= hi {
                     result.insert(idx);
                 }
             }
         } else {
             let wanted = parse_uid_num(part, max_uid);
             for (idx, entry) in entries.iter().enumerate() {
-                if uid_for_filename(&entry.filename) == wanted {
+                if entry.uid == wanted {
                     result.insert(idx);
                 }
             }
@@ -920,47 +1065,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
-fn next_uid(entries: &[rmail_mailbox::MaildirEntry]) -> u32 {
-    entries
-        .iter()
-        .map(|e| uid_for_filename(&e.filename))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
-}
-
-fn uid_for_filename(filename: &str) -> u32 {
-    let base = filename.split_once('.').and_then(|(ts, rest)| {
-        let ts = ts.parse::<u32>().ok()?;
-        let counter = rest
-            .split_once('_')
-            .and_then(|(_, suffix)| suffix.split('.').next())
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(0);
-        let epoch = ts.saturating_sub(1_600_000_000);
-        Some(epoch.saturating_mul(1024).saturating_add(counter.min(1023)))
-    });
-    if let Some(uid) = base {
-        return uid.max(1);
-    }
-    let mut hash: u32 = 2_166_136_261;
-    for b in filename.as_bytes() {
-        hash ^= *b as u32;
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash.max(1)
-}
-
 // ─── Message helpers ─────────────────────────────────────────────────────────
-
-fn uid_validity(user: &Address, mailbox: &str) -> i64 {
-    let key = format!("{}:{}:{}", user.local, user.domain, mailbox);
-    let mut hash: i64 = 1_704_067_200; // 2024-01-01; stable non-zero base.
-    for b in key.as_bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(*b as i64);
-    }
-    hash.unsigned_abs().min(i64::MAX as u64) as i64
-}
 
 fn flags_to_maildir(flags: &[String]) -> Vec<char> {
     let mut out = Vec::new();
@@ -1007,14 +1112,9 @@ fn apply_flag_bool(current: bool, mentioned: bool, op: FlagOp) -> bool {
     }
 }
 
-async fn internal_date(entry: &rmail_mailbox::MaildirEntry) -> String {
-    let dt = match tokio::fs::metadata(&entry.path)
-        .await
-        .and_then(|m| m.modified())
-    {
-        Ok(modified) => time::OffsetDateTime::from(modified),
-        Err(_) => time::OffsetDateTime::now_utc(),
-    };
+fn internal_date(entry: &rmail_mailbox::MaildirEntry) -> String {
+    let dt = time::OffsetDateTime::from_unix_timestamp(entry.mtime)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     dt.format(time::macros::format_description!(
         "[day padding:zero]-[month repr:short]-[year] [hour]:[minute]:[second] [offset_hour sign:mandatory][offset_minute]"
     ))
@@ -1259,8 +1359,9 @@ mod tests {
         let greeting = String::from_utf8(greeting).unwrap();
         assert!(greeting.contains("LITERAL+"));
         assert!(greeting.contains("MOVE"));
-        assert!(!greeting.contains("AUTH=PLAIN"));
+        assert!(greeting.contains("AUTH=PLAIN"));
         assert!(!greeting.contains("LOGINDISABLED"));
+        assert!(!greeting.contains("STARTTLS"));
     }
 
     #[tokio::test]

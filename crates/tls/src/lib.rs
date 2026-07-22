@@ -109,12 +109,30 @@ pub struct TlsConnector {
 }
 
 impl TlsConnector {
+    /// Strict connector: verifies the server certificate against the WebPKI
+    /// roots. Use for MTA-STS enforce / require_starttls deliveries.
     pub fn new() -> Self {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        Self {
+            inner: TokioConnector::from(Arc::new(config)),
+        }
+    }
+
+    /// Permissive connector for opportunistic STARTTLS: encrypts without
+    /// authenticating the peer. This matches Postfix's `smtp_tls_security_level
+    /// = may` — many MTAs serve self-signed certificates, and rejecting them
+    /// would make legitimate mail undeliverable. Use `TlsConnector::new()`
+    /// whenever a policy (MTA-STS, require_starttls) demands authentication.
+    pub fn permissive() -> Self {
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();
 
         Self {
@@ -162,5 +180,57 @@ impl TlsConnector {
 impl Default for TlsConnector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ─── Opportunistic certificate verifier ─────────────────────────────────────
+
+/// Accepts any server certificate. Only used by `TlsConnector::permissive()`
+/// for opportunistic MTA-to-MTA STARTTLS, where encryption is better than
+/// no delivery at all.
+#[derive(Debug)]
+struct NoVerify;
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

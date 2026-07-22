@@ -9,9 +9,7 @@ rmail-config = { path = "../config" }
 rmail-auth   = { path = "../auth" }
 rmail-tls    = { path = "../tls" }
 nom          = { workspace = true }
-bytes        = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
 thiserror    = { workspace = true }
 base64       = { workspace = true }
-time         = { workspace = true }

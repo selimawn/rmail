@@ -5,6 +5,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,6 +36,15 @@ pub fn verify(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// A real argon2id hash of a random dummy password.
+///
+/// Verify unknown usernames against this so that a failed login costs the
+/// same time as a real one — prevents user enumeration via timing.
+pub fn dummy_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| hash("rmail dummy password for missing users").expect("dummy hash"))
 }
 
 #[cfg(test)]

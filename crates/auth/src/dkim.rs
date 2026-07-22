@@ -1,47 +1,12 @@
-//! DKIM verification (inbound) and signing (outbound).
-//! Uses `mail-auth` 0.5.
+//! DKIM signing (outbound).
+//! Inbound verification is handled by `checker.rs` via mail-auth.
 
 use mail_auth::common::headers::HeaderWriter;
 use mail_auth::{
     common::crypto::{RsaKey, Sha256},
     dkim::DkimSigner,
-    AuthenticatedMessage,
 };
 use thiserror::Error;
-use tracing::debug;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DkimVerdict {
-    Pass,
-    Fail,
-    PermError,
-    TempError,
-    None,
-}
-
-impl std::fmt::Display for DkimVerdict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Pass => "pass",
-            Self::Fail => "fail",
-            Self::PermError => "permerror",
-            Self::TempError => "temperror",
-            Self::None => "none",
-        })
-    }
-}
-
-/// Stub: verify is handled by checker.rs using mail-auth's full resolver pipeline.
-/// This function is kept for direct/unit-test use.
-pub async fn verify(raw_message: &[u8]) -> DkimVerdict {
-    match AuthenticatedMessage::parse(raw_message) {
-        Some(_) => {
-            debug!("DKIM verify (use checker::verify for full DNS-based verification)");
-            DkimVerdict::None
-        }
-        Option::None => DkimVerdict::PermError,
-    }
-}
 
 /// Sign a raw RFC 5322 message with an RSA-SHA256 DKIM signature.
 /// Prepends the `DKIM-Signature:` header to the message.

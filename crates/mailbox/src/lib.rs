@@ -6,6 +6,7 @@
 //! ├── cur/          messages seen by IMAP
 //! ├── new/          messages not yet seen
 //! ├── tmp/          delivery staging (atomic rename to new/)
+//! ├── rmail-uidmap  persistent IMAP UID ↔ filename mapping
 //! ├── .Sent/{cur,new,tmp}
 //! ├── .Drafts/{cur,new,tmp}
 //! ├── .Trash/{cur,new,tmp}
@@ -15,6 +16,10 @@
 //! One file = one message. Lock-free thanks to atomic `rename(2)` from
 //! `tmp/` to `new/`. Every state-changing rename is followed by a parent-
 //! directory fsync so the change is durable across kernel crashes.
+//!
+//! IMAP UIDs are persistent: each folder owns a `rmail-uidmap` file mapping
+//! UIDs to message basenames, plus a stable UIDVALIDITY. UIDs never shrink
+//! and never repeat.
 
 use rmail_config::{StorageBackend, StorageConfig};
 use rmail_core::Address;
@@ -34,6 +39,8 @@ pub enum MailboxError {
     UserNotFound(String),
     #[error("folder not found: {0}")]
     FolderNotFound(String),
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("storage.backend = \"s3\" requires [storage.s3]")]
@@ -43,6 +50,21 @@ pub enum MailboxError {
 pub struct Maildir {
     root: PathBuf,
     s3: Option<S3Store>,
+}
+
+/// Reject address components that could escape the mailbox root.
+fn validate_address(address: &Address) -> Result<(), MailboxError> {
+    let bad = |p: &str| {
+        p.is_empty()
+            || p.contains("..")
+            || p.contains('/')
+            || p.contains('\\')
+            || p.chars().any(|c| c.is_control() || c.is_whitespace())
+    };
+    if bad(&address.local) || bad(&address.domain) {
+        return Err(MailboxError::InvalidAddress(address.as_str()));
+    }
+    Ok(())
 }
 
 impl Maildir {
@@ -112,6 +134,7 @@ impl Maildir {
 
     /// Create the full Maildir++ structure for a new user.
     pub async fn create_user(&self, address: &Address) -> Result<(), MailboxError> {
+        validate_address(address)?;
         if let Some(store) = &self.s3 {
             for folder in ["INBOX", "Sent", "Drafts", "Trash", "Junk"] {
                 for sub in ["cur", "new", "tmp"] {
@@ -140,6 +163,9 @@ impl Maildir {
     }
 
     pub async fn user_exists(&self, address: &Address) -> bool {
+        if validate_address(address).is_err() {
+            return false;
+        }
         if let Some(store) = &self.s3 {
             return self.s3_user_exists(store, address).await.unwrap_or(false);
         }
@@ -164,6 +190,7 @@ impl Maildir {
         body: &[u8],
         flags: &str,
     ) -> Result<String, MailboxError> {
+        validate_address(address)?;
         if let Some(store) = &self.s3 {
             if !self.s3_user_exists(store, address).await? {
                 return Err(MailboxError::UserNotFound(address.as_str()));
@@ -217,43 +244,16 @@ impl Maildir {
 
     // ─── List ─────────────────────────────────────────────────────────────────────────
 
-    /// List all messages in a folder (both `cur/` and `new/`).
+    /// List all messages in a folder (both `cur/` and `new/`), with stable
+    /// IMAP UIDs. Reconciles the folder's `rmail-uidmap` file on every call.
     pub async fn list_messages(
         &self,
         address: &Address,
         folder: &str,
-    ) -> Result<Vec<MaildirEntry>, MailboxError> {
+    ) -> Result<FolderListing, MailboxError> {
+        validate_address(address)?;
         if let Some(store) = &self.s3 {
-            let folder_prefix = self.folder_prefix(address, folder);
-            if folder != "INBOX" && store.list(&folder_prefix).await?.is_empty() {
-                return Err(MailboxError::FolderNotFound(folder.to_owned()));
-            }
-            let mut entries = Vec::new();
-            for (subdir, in_new) in [("new", true), ("cur", false)] {
-                let prefix = format!("{}{}/", folder_prefix, subdir);
-                for key in store.list(&prefix).await? {
-                    let Some(filename) = key.strip_prefix(&prefix) else {
-                        continue;
-                    };
-                    if filename == ".keep" || filename.contains('/') {
-                        continue;
-                    }
-                    let filename = filename.to_owned();
-                    let body = store.get(&key).await?;
-                    let flags = parse_maildir_flags(&filename);
-                    entries.push(MaildirEntry {
-                        path: PathBuf::from(key),
-                        filename: filename.clone(),
-                        size: body.len() as u64,
-                        seen: !in_new && flags.contains('S'),
-                        flagged: flags.contains('F'),
-                        deleted: flags.contains('T'),
-                        answered: flags.contains('R'),
-                        draft: flags.contains('D'),
-                    });
-                }
-            }
-            return Ok(entries);
+            return self.list_messages_s3(store, address, folder).await;
         }
         let folder_dir = self.folder_dir(address, folder);
         if !folder_dir.exists() {
@@ -274,6 +274,12 @@ impl Maildir {
                 }
                 let filename = entry.file_name().to_string_lossy().into_owned();
                 let flags = parse_maildir_flags(&filename);
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_else(|| filename_timestamp(&filename));
                 entries.push(MaildirEntry {
                     path: entry.path(),
                     filename: filename.clone(),
@@ -283,14 +289,92 @@ impl Maildir {
                     deleted: flags.contains('T'),
                     answered: flags.contains('R'),
                     draft: flags.contains('D'),
+                    uid: 0,
+                    recent: in_new,
+                    mtime,
                 });
             }
         }
-        Ok(entries)
+
+        let db_path = folder_dir.join(UIDMAP_FILE);
+        let raw = fs::read(&db_path).await.ok();
+        let mut map = raw
+            .as_deref()
+            .and_then(UidMap::parse)
+            .unwrap_or_default();
+        // Persist even when unchanged if the file did not exist yet, so an
+        // empty folder keeps a stable UIDVALIDITY across sessions.
+        if map.reconcile(&mut entries) || raw.is_none() {
+            let tmp = folder_dir.join(".rmail-uidmap.tmp");
+            if fs::write(&tmp, map.serialize()).await.is_ok() {
+                let _ = fs::rename(&tmp, &db_path).await;
+                let _ = fsync_dir(&folder_dir).await;
+            }
+        }
+        Ok(FolderListing {
+            entries,
+            uid_validity: map.validity,
+            uid_next: map.next,
+        })
+    }
+
+    async fn list_messages_s3(
+        &self,
+        store: &S3Store,
+        address: &Address,
+        folder: &str,
+    ) -> Result<FolderListing, MailboxError> {
+        let folder_prefix = self.folder_prefix(address, folder);
+        if folder != "INBOX" && store.list(&folder_prefix).await?.is_empty() {
+            return Err(MailboxError::FolderNotFound(folder.to_owned()));
+        }
+        let mut entries = Vec::new();
+        for (subdir, in_new) in [("new", true), ("cur", false)] {
+            let prefix = format!("{}{}/", folder_prefix, subdir);
+            for item in store.list_detailed(&prefix).await? {
+                let Some(filename) = item.key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if filename == ".keep" || filename.contains('/') {
+                    continue;
+                }
+                let filename = filename.to_owned();
+                let flags = parse_maildir_flags(&filename);
+                entries.push(MaildirEntry {
+                    path: PathBuf::from(&item.key),
+                    filename: filename.clone(),
+                    size: item.size,
+                    seen: !in_new && flags.contains('S'),
+                    flagged: flags.contains('F'),
+                    deleted: flags.contains('T'),
+                    answered: flags.contains('R'),
+                    draft: flags.contains('D'),
+                    uid: 0,
+                    recent: in_new,
+                    mtime: filename_timestamp(&filename),
+                });
+            }
+        }
+
+        let db_key = format!("{}{}", folder_prefix, UIDMAP_FILE);
+        let raw = store.get(&db_key).await.ok();
+        let mut map = raw
+            .as_deref()
+            .and_then(UidMap::parse)
+            .unwrap_or_default();
+        if map.reconcile(&mut entries) || raw.is_none() {
+            let _ = store.put(&db_key, map.serialize()).await;
+        }
+        Ok(FolderListing {
+            entries,
+            uid_validity: map.validity,
+            uid_next: map.next,
+        })
     }
 
     /// List all folders for a user (INBOX + Maildir++ subdirs).
     pub async fn list_folders(&self, address: &Address) -> Result<Vec<String>, MailboxError> {
+        validate_address(address)?;
         if let Some(store) = &self.s3 {
             if !self.s3_user_exists(store, address).await? {
                 return Err(MailboxError::UserNotFound(address.as_str()));
@@ -326,6 +410,7 @@ impl Maildir {
     }
 
     pub async fn create_folder(&self, address: &Address, folder: &str) -> Result<(), MailboxError> {
+        validate_address(address)?;
         if folder == "INBOX" {
             return Ok(());
         }
@@ -349,6 +434,7 @@ impl Maildir {
     }
 
     pub async fn delete_folder(&self, address: &Address, folder: &str) -> Result<(), MailboxError> {
+        validate_address(address)?;
         if folder == "INBOX" {
             return Err(MailboxError::FolderNotFound(folder.to_owned()));
         }
@@ -371,6 +457,7 @@ impl Maildir {
         from: &str,
         to: &str,
     ) -> Result<(), MailboxError> {
+        validate_address(address)?;
         if from == "INBOX" || to == "INBOX" {
             return Err(MailboxError::FolderNotFound(from.to_owned()));
         }
@@ -414,34 +501,27 @@ impl Maildir {
             .await
     }
 
-    // ─── Move to cur (IMAP "seen") ─────────────────────────────────────────────────────
+    // ─── Move to cur (IMAP "seen by a client") ─────────────────────────────────────
 
-    /// Move a message from `new/` to `cur/` when IMAP selects the mailbox.
-    /// Appends `:2,S` flags to the filename. The `cur/` directory is fsynced
-    /// so the rename survives a crash.
+    /// Move a message from `new/` to `cur/` when a client selects the mailbox.
+    /// The filename (and therefore its flags and UID) is preserved — the
+    /// message becomes "no longer recent" but is NOT marked `\Seen`.
     pub async fn move_to_cur(&self, path: &Path) -> Result<PathBuf, MailboxError> {
         if let Some(store) = &self.s3 {
             let key = path.to_string_lossy();
             let filename = s3_filename(&key)?;
-            let new_name = if filename.contains(":2,") {
-                add_flag(filename, 'S')
-            } else {
-                format!("{}:2,S", filename)
-            };
-            let new_key = s3_replace_subdir_and_name(&key, "cur", &new_name)?;
+            let new_key = s3_replace_subdir_and_name(&key, "cur", filename)?;
+            if new_key == key {
+                return Ok(path.to_owned());
+            }
             let body = store.get(&key).await?;
             store.put(&new_key, body).await?;
             store.delete(&key).await?;
             return Ok(PathBuf::from(new_key));
         }
         let filename = path.file_name().unwrap().to_string_lossy();
-        let new_name = if filename.contains(":2,") {
-            add_flag(&filename, 'S')
-        } else {
-            format!("{}:2,S", filename)
-        };
         let cur_dir = path.parent().unwrap().parent().unwrap().join("cur");
-        let new_path = cur_dir.join(&new_name);
+        let new_path = cur_dir.join(filename.as_ref());
         tokio::fs::rename(path, &new_path).await?;
         let _ = fsync_dir(&cur_dir).await;
         Ok(new_path)
@@ -481,6 +561,11 @@ impl Maildir {
             let new_name = replace_flags(filename, &set.iter().collect::<String>());
             let target_subdir = if set.contains(&'S') { "cur" } else { "new" };
             let new_key = s3_replace_subdir_and_name(&key, target_subdir, &new_name)?;
+            if new_key == key {
+                // Flags unchanged — rewriting then deleting the same key
+                // would destroy the message.
+                return Ok(path.to_owned());
+            }
             let body = store.get(&key).await?;
             store.put(&new_key, body).await?;
             store.delete(&key).await?;
@@ -535,6 +620,14 @@ impl Maildir {
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
+/// Result of listing a folder: messages plus IMAP UID metadata.
+#[derive(Debug, Clone)]
+pub struct FolderListing {
+    pub entries: Vec<MaildirEntry>,
+    pub uid_validity: u32,
+    pub uid_next: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct MaildirEntry {
     pub path: PathBuf,
@@ -545,6 +638,12 @@ pub struct MaildirEntry {
     pub deleted: bool,
     pub answered: bool,
     pub draft: bool,
+    /// Persistent IMAP UID (assigned from the folder's uidmap).
+    pub uid: u32,
+    /// True while the message sits in `new/` (never seen by any client).
+    pub recent: bool,
+    /// Modification / delivery time as unix seconds.
+    pub mtime: i64,
 }
 
 impl MaildirEntry {
@@ -576,6 +675,98 @@ pub enum FlagOp {
     Replace,
 }
 
+// ─── Persistent UID map ─────────────────────────────────────────────────────────
+
+const UIDMAP_FILE: &str = "rmail-uidmap";
+
+/// On-disk UID database for one folder. First line: `V <uidvalidity> <next>`.
+/// Following lines: `<uid> <basename>` (basename = filename without `:2,`
+/// flags, so flag changes and `new/`→`cur/` moves keep the UID).
+struct UidMap {
+    validity: u32,
+    next: u32,
+    map: Vec<(u32, String)>,
+}
+
+impl Default for UidMap {
+    fn default() -> Self {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            validity: (secs % u32::MAX as u64) as u32,
+            next: 1,
+            map: Vec::new(),
+        }
+    }
+}
+
+impl UidMap {
+    fn parse(raw: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(raw).ok()?;
+        let mut lines = text.lines();
+        let header = lines.next()?;
+        let mut parts = header.split_whitespace();
+        if parts.next()? != "V" {
+            return None;
+        }
+        let validity = parts.next()?.parse().ok()?;
+        let next = parts.next()?.parse().ok()?;
+        let mut map = Vec::new();
+        for line in lines {
+            let (uid, name) = line.split_once(' ')?;
+            map.push((uid.parse().ok()?, name.to_owned()));
+        }
+        Some(Self {
+            validity,
+            next,
+            map,
+        })
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = format!("V {} {}\n", self.validity, self.next);
+        for (uid, name) in &self.map {
+            out.push_str(&format!("{} {}\n", uid, name));
+        }
+        out.into_bytes()
+    }
+
+    /// Assign UIDs to every entry. Removes mappings for vanished files,
+    /// allocates fresh UIDs for new files. Returns true when the map changed.
+    fn reconcile(&mut self, entries: &mut [MaildirEntry]) -> bool {
+        let mut changed = false;
+        let present: BTreeSet<&str> = entries
+            .iter()
+            .map(|e| basename(&e.filename))
+            .collect();
+        let before = self.map.len();
+        self.map.retain(|(_, name)| present.contains(name.as_str()));
+        if self.map.len() != before {
+            changed = true;
+        }
+        for entry in entries.iter_mut() {
+            let base = basename(&entry.filename);
+            if let Some((uid, _)) = self.map.iter().find(|(_, n)| n == base) {
+                entry.uid = *uid;
+            } else {
+                let uid = self.next;
+                self.next = self.next.saturating_add(1);
+                self.map.push((uid, base.to_owned()));
+                entry.uid = uid;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Filename without the `:2,FLAGS` Maildir suffix.
+fn basename(filename: &str) -> &str {
+    filename.split_once(":2,").map(|(base, _)| base).unwrap_or(filename)
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Generate a unique Maildir filename.
@@ -592,6 +783,14 @@ fn unique_filename() -> String {
     format!("{}.{}_{}.rmail", ts, pid, n)
 }
 
+/// Delivery time encoded in the unique filename (epoch seconds prefix).
+fn filename_timestamp(filename: &str) -> i64 {
+    filename
+        .split_once('.')
+        .and_then(|(ts, _)| ts.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 /// Extract Maildir flags from filename.
 /// Filename may end in `:2,FLAGS` (e.g. `:2,FS` = Flagged + Seen).
 fn parse_maildir_flags(filename: &str) -> &str {
@@ -599,25 +798,6 @@ fn parse_maildir_flags(filename: &str) -> &str {
         &filename[idx + 3..]
     } else {
         ""
-    }
-}
-
-/// Add a Maildir flag character to a filename (flags are sorted alphabetically).
-fn add_flag(filename: &str, flag: char) -> String {
-    if let Some(idx) = filename.rfind(":2,") {
-        let flags = &filename[idx + 3..];
-        if flags.contains(flag) {
-            return filename.to_owned();
-        }
-        let mut chars: Vec<char> = flags.chars().chain(std::iter::once(flag)).collect();
-        chars.sort_unstable();
-        format!(
-            "{}:2,{}",
-            &filename[..idx],
-            chars.iter().collect::<String>()
-        )
-    } else {
-        format!("{}:2,{}", filename, flag)
     }
 }
 
@@ -669,4 +849,95 @@ async fn fsync_dir(path: &Path) -> std::io::Result<()> {
     let f = fs::File::open(path).await?;
     f.sync_all().await?;
     Ok(())
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uidmap_roundtrip() {
+        let mut map = UidMap {
+            validity: 42,
+            ..UidMap::default()
+        };
+        let mut entries = vec![
+            MaildirEntry {
+                path: PathBuf::from("/x/new/1.2_3.rmail"),
+                filename: "1.2_3.rmail".into(),
+                size: 10,
+                seen: false,
+                flagged: false,
+                deleted: false,
+                answered: false,
+                draft: false,
+                uid: 0,
+                recent: true,
+                mtime: 1,
+            },
+            MaildirEntry {
+                path: PathBuf::from("/x/cur/4.5_6.rmail:2,S"),
+                filename: "4.5_6.rmail:2,S".into(),
+                size: 20,
+                seen: true,
+                flagged: false,
+                deleted: false,
+                answered: false,
+                draft: false,
+                uid: 0,
+                recent: false,
+                mtime: 2,
+            },
+        ];
+        assert!(map.reconcile(&mut entries));
+        assert_eq!(entries[0].uid, 1);
+        assert_eq!(entries[1].uid, 2);
+        assert_eq!(map.next, 3);
+
+        // Flags change → same basename → same UID, no map change.
+        entries[1].filename = "4.5_6.rmail:2,FS".into();
+        assert!(!map.reconcile(&mut entries));
+        assert_eq!(entries[1].uid, 2);
+
+        // Survives a serialize/parse cycle.
+        let bytes = map.serialize();
+        let mut map2 = UidMap::parse(&bytes).unwrap();
+        assert_eq!(map2.validity, 42);
+        assert!(!map2.reconcile(&mut entries));
+        assert_eq!(entries[0].uid, 1);
+
+        // New message gets the next UID; vanished message is dropped.
+        entries.remove(0);
+        entries.push(MaildirEntry {
+            path: PathBuf::from("/x/new/7.8_9.rmail"),
+            filename: "7.8_9.rmail".into(),
+            size: 5,
+            seen: false,
+            flagged: false,
+            deleted: false,
+            answered: false,
+            draft: false,
+            uid: 0,
+            recent: true,
+            mtime: 3,
+        });
+        assert!(map2.reconcile(&mut entries));
+        assert_eq!(entries[1].uid, 3);
+        assert_eq!(map2.map.len(), 2);
+    }
+
+    #[test]
+    fn validate_address_rejects_traversal() {
+        let mut a = Address {
+            local: "..".into(),
+            domain: "example.com".into(),
+        };
+        assert!(validate_address(&a).is_err());
+        a.local = "alice".into();
+        assert!(validate_address(&a).is_ok());
+        a.domain = "exa/mple.com".into();
+        assert!(validate_address(&a).is_err());
+    }
 }

@@ -8,7 +8,7 @@ rmail-core    = { path = "../core" }
 rmail-config  = { path = "../config" }
 rmail-mailbox = { path = "../mailbox" }
 rmail-auth    = { path = "../auth" }
-nom           = { workspace = true }
+base64        = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }

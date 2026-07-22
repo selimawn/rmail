@@ -10,7 +10,6 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rmail_config::Config;
 use rmail_core::{Address, Envelope};
 use std::net::IpAddr;
-use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// Maximum line length we accept before hard-closing (prevents memory abuse).
@@ -35,10 +34,45 @@ pub enum State {
     Rcpt,
     /// DATA accepted, reading message body.
     Data,
+    /// AUTH PLAIN without initial response: waiting for the base64 blob.
+    AuthPlain,
     /// AUTH in progress (LOGIN mechanism, waiting for password).
     AuthLoginPass { username: String },
     /// Session closed.
     Closed,
+}
+
+/// Redacted state name for logs — never leaks the AUTH username blob.
+fn state_name(state: &State) -> &'static str {
+    match state {
+        State::Connected => "Connected",
+        State::Greeted => "Greeted",
+        State::Tls => "Tls",
+        State::Mailing => "Mailing",
+        State::Rcpt => "Rcpt",
+        State::Data => "Data",
+        State::AuthPlain => "AuthPlain",
+        State::AuthLoginPass { .. } => "AuthLoginPass",
+        State::Closed => "Closed",
+    }
+}
+
+/// Redacted command name for logs — never leaks credentials or payloads.
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Ehlo(_) => "EHLO",
+        Command::Helo(_) => "HELO",
+        Command::MailFrom { .. } => "MAIL FROM",
+        Command::RcptTo(_) => "RCPT TO",
+        Command::Data => "DATA",
+        Command::Rset => "RSET",
+        Command::Noop => "NOOP",
+        Command::Quit => "QUIT",
+        Command::StartTls => "STARTTLS",
+        Command::AuthPlain(_) => "AUTH PLAIN",
+        Command::AuthLogin => "AUTH LOGIN",
+        Command::Vrfy(_) => "VRFY",
+    }
 }
 
 /// What the caller must do after `step()`.
@@ -119,6 +153,7 @@ impl Session {
 
         match &self.state {
             State::Data => self.handle_data_line(line, config),
+            State::AuthPlain => self.handle_auth_plain_blob(line, config),
             State::AuthLoginPass { username } => {
                 let user = username.clone();
                 self.handle_auth_login_pass(line, &user, config)
@@ -139,7 +174,12 @@ impl Session {
     // ─── command dispatch ─────────────────────────────────────────────────────
 
     fn handle_command(&mut self, cmd: Command, config: &Config) -> Action {
-        debug!(peer = %self.peer_ip, state = ?self.state, ?cmd, "SMTP command");
+        debug!(
+            peer = %self.peer_ip,
+            state = state_name(&self.state),
+            cmd = command_name(&cmd),
+            "SMTP command"
+        );
         match cmd {
             Command::Ehlo(domain) | Command::Helo(domain) => self.do_ehlo(domain, config),
             Command::StartTls => self.do_starttls(),
@@ -147,7 +187,10 @@ impl Session {
             Command::RcptTo(addr) => self.do_rcpt_to(addr, config),
             Command::Data => self.do_data(),
             Command::Rset => self.do_rset(),
-            Command::Quit => Action::Close(Reply::bye().to_wire()),
+            Command::Quit => {
+                self.state = State::Closed;
+                Action::Close(Reply::bye().to_wire())
+            }
             Command::Noop => Action::Reply(Reply::ok().to_wire()),
             Command::AuthPlain(initial) => self.do_auth_plain(initial, config),
             Command::AuthLogin => self.do_auth_login(),
@@ -286,10 +329,10 @@ impl Session {
         Action::Reply(vec![])
     }
 
-    fn finalize_data(&mut self, config: &Config) -> Action {
+    fn finalize_data(&mut self, _config: &Config) -> Action {
         let from = self.from.take().unwrap_or_else(Address::null);
         let rcpts = std::mem::take(&mut self.rcpts);
-        let raw = std::mem::take(&mut self.body_buf);
+        let body = std::mem::take(&mut self.body_buf);
         let envelope = Envelope::new(
             from,
             rcpts,
@@ -297,9 +340,8 @@ impl Session {
             self.helo.clone(),
             self.auth_user.clone(),
         );
-        // Prepend Received: trace header (RFC 5321 §3.7.2). Required for all
-        // accepted mail; downstream MTAs use it for loop detection.
-        let body = prepend_received(&raw, &envelope, &config.server.hostname);
+        // Note: the Received: trace header is prepended by the listener,
+        // which has access to the resolver for the rDNS lookup.
         let id = envelope.id.to_string();
         info!(id, peer = %self.peer_ip, "message accepted");
         self.state = if self.tls_active {
@@ -323,9 +365,34 @@ impl Session {
         }
         let blob = match initial {
             Some(b) => b,
-            None => return Action::Reply(Reply::auth_continue("").to_wire()),
+            None => {
+                // No initial response: ask for it and wait for the next line.
+                self.state = State::AuthPlain;
+                return Action::Reply(Reply::auth_continue("").to_wire());
+            }
         };
         if let Some(user) = verify_plain(&blob, config) {
+            info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
+            self.auth_user = Some(user);
+            Action::Reply(Reply::auth_ok().to_wire())
+        } else {
+            warn!(peer = %self.peer_ip, "AUTH PLAIN failed");
+            Action::Reply(Reply::auth_fail().to_wire())
+        }
+    }
+
+    fn handle_auth_plain_blob(&mut self, line: &[u8], config: &Config) -> Action {
+        self.state = if self.tls_active {
+            State::Tls
+        } else {
+            State::Greeted
+        };
+        let line_str = std::str::from_utf8(line).unwrap_or("").trim();
+        if line_str == "*" {
+            // Client aborted the AUTH exchange.
+            return Action::Reply(Reply::auth_fail().to_wire());
+        }
+        if let Some(user) = verify_plain(line_str, config) {
             info!(peer = %self.peer_ip, %user, "AUTH PLAIN success");
             self.auth_user = Some(user);
             Action::Reply(Reply::auth_ok().to_wire())
@@ -381,7 +448,7 @@ impl Session {
         let hash = if let Some(u) = cfg_user {
             u.password_hash.as_str()
         } else {
-            dummy_password_hash()
+            rmail_auth::password::dummy_hash()
         };
         if rmail_auth::password::verify(&pass, hash) && cfg_user.is_some() {
             info!(peer = %self.peer_ip, %user, "AUTH LOGIN success");
@@ -414,6 +481,12 @@ impl Session {
         self.state == State::Closed
     }
 
+    /// True while the session is accumulating a DATA body — used by the
+    /// listener to bound concurrent in-memory bodies.
+    pub fn in_data(&self) -> bool {
+        self.state == State::Data
+    }
+
     pub fn mark_tls_active(&mut self) {
         self.tls_active = true;
         self.helo.clear();
@@ -441,62 +514,18 @@ fn verify_plain(blob: &str, config: &rmail_config::Config) -> Option<String> {
     let user = std::str::from_utf8(parts[1]).ok()?;
     let pass = std::str::from_utf8(parts[2]).ok()?;
     if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(user) {
-        let _ = rmail_auth::password::verify(pass, dummy_password_hash());
+        let _ = rmail_auth::password::verify(pass, rmail_auth::password::dummy_hash());
         return None;
     }
     let cfg_user = config.find_user(user);
     let hash = if let Some(u) = cfg_user {
         u.password_hash.as_str()
     } else {
-        dummy_password_hash()
+        rmail_auth::password::dummy_hash()
     };
     if rmail_auth::password::verify(pass, hash) && cfg_user.is_some() {
         Some(user.to_owned())
     } else {
         None
     }
-}
-
-fn dummy_password_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| {
-        rmail_auth::password::hash("rmail dummy password for missing users")
-            .expect("dummy password hash generation")
-    })
-}
-
-/// Build the `Received:` trace header per RFC 5321 §3.7.2 and prepend it
-/// to the raw message body. Header insertion happens here — *before* the
-/// message is enqueued — so it is part of the original on-disk write and
-/// cannot be duplicated by retries.
-fn prepend_received(body: &[u8], envelope: &Envelope, our_hostname: &str) -> Vec<u8> {
-    let ts = envelope
-        .received_at
-        .format(&time::format_description::well_known::Rfc2822)
-        .unwrap_or_else(|_| "unknown".to_owned());
-    let first_rcpt = envelope
-        .recipients
-        .first()
-        .map(|r| r.address.to_string())
-        .unwrap_or_else(|| "<unknown>".into());
-    let with = if envelope.auth_user.is_some() {
-        "ESMTPSA"
-    } else {
-        "ESMTP"
-    };
-    let header = format!(
-        "Received: from {} ({} [{}])\r\n\tby {} (rmail) with {} id {}\r\n\tfor {}; {}\r\n",
-        envelope.client_helo,
-        envelope.client_helo,
-        envelope.client_ip,
-        our_hostname,
-        with,
-        envelope.id,
-        first_rcpt,
-        ts,
-    );
-    let mut out = Vec::with_capacity(header.len() + body.len());
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(body);
-    out
 }

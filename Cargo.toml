@@ -28,8 +28,6 @@ tokio-rustls       = "0.26"
 rustls             = { version = "0.23", features = ["ring"] }
 rustls-pemfile     = "2"
 hickory-resolver   = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls"] }
-mail-parser        = "0.9"
-mail-builder       = "0.3"
 mail-auth          = "0.5"
 nom                = "7"
 serde              = { version = "1", features = ["derive"] }

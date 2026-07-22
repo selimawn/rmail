@@ -90,6 +90,17 @@ impl Address {
         if local.is_empty() || domain.is_empty() {
             return Err(CoreError::InvalidAddress(s.to_owned()));
         }
+        // Reject whitespace, control chars and path-traversal sequences.
+        // The local-part is used as a filesystem path component by Maildir.
+        let bad = |p: &str| {
+            p.chars().any(|c| c.is_whitespace() || c.is_control())
+                || p.contains("..")
+                || p.contains('/')
+                || p.contains('\\')
+        };
+        if bad(local) || bad(domain) {
+            return Err(CoreError::InvalidAddress(s.to_owned()));
+        }
         Ok(Self {
             local: local.to_lowercase(),
             domain: domain.to_lowercase(),
@@ -167,6 +178,8 @@ pub struct Envelope {
     pub retry_count: u32,
     /// Unix epoch second of the next scheduled retry (None = try now).
     pub next_retry_at: Option<i64>,
+    /// DMARC quarantine: deliver local recipients to Junk instead of INBOX.
+    pub quarantine: bool,
 }
 
 impl Envelope {
@@ -193,6 +206,7 @@ impl Envelope {
             auth_user,
             retry_count: 0,
             next_retry_at: None,
+            quarantine: false,
         }
     }
 
@@ -327,6 +341,24 @@ mod tests {
         let a = Address::parse("Alice@Example.COM").unwrap();
         assert_eq!(a.local, "alice");
         assert_eq!(a.domain, "example.com");
+    }
+
+    #[test]
+    fn address_parse_rejects_whitespace() {
+        assert!(Address::parse("al ice@example.com").is_err());
+        assert!(Address::parse("alice@exa mple.com").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_path_traversal() {
+        assert!(Address::parse("../etc@example.com").is_err());
+        assert!(Address::parse("a/b@example.com").is_err());
+        assert!(Address::parse("alice@example.com/x").is_err());
+    }
+
+    #[test]
+    fn address_parse_rejects_control_chars() {
+        assert!(Address::parse("al\tice@example.com").is_err());
     }
 
     #[test]

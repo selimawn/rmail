@@ -8,6 +8,7 @@ use mail_auth::{
     SpfResult,
 };
 use std::net::IpAddr;
+use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 #[derive(Debug)]
@@ -19,24 +20,29 @@ pub struct AuthResults {
 
 impl AuthResults {
     /// Produce the `Authentication-Results:` header value.
-    pub fn header(&self, server_hostname: &str) -> String {
+    pub fn header(&self, server_hostname: &str, mail_from_domain: &str) -> String {
         format!(
             "{host};\r\n spf={spf} smtp.mailfrom={spf_domain};\r\n dkim={dkim};\r\n dmarc={dmarc}",
             host = server_hostname,
             spf = self.spf.label(),
-            spf_domain = self.spf.domain(),
+            spf_domain = mail_from_domain,
             dkim = self.dkim.label(),
             dmarc = self.dmarc.label(),
         )
     }
 
-    /// True when local policy should reject this message.
+    /// True when local policy must reject this message (DMARC p=reject).
     pub fn should_reject(&self) -> Option<&'static str> {
-        if matches!(self.dmarc, DmarcOutcome::Reject | DmarcOutcome::Quarantine) {
+        if matches!(self.dmarc, DmarcOutcome::Reject) {
             Some("Message rejected due to DMARC policy")
         } else {
             None
         }
+    }
+
+    /// True when DMARC asks for quarantine — deliver to Junk, not INBOX.
+    pub fn should_quarantine(&self) -> bool {
+        matches!(self.dmarc, DmarcOutcome::Quarantine)
     }
 }
 
@@ -62,9 +68,6 @@ impl SpfOutcome {
             Self::PermError => "permerror",
         }
     }
-    pub fn domain(&self) -> &str {
-        ""
-    } // filled by caller
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +110,21 @@ impl DmarcOutcome {
     }
 }
 
+/// Shared mail-auth resolver, built once. Holds its own DNS cache, so
+/// reusing it across messages avoids a full resolver bootstrap per message.
+fn shared_resolver() -> Option<&'static MailAuthResolver> {
+    static RESOLVER: OnceLock<Option<MailAuthResolver>> = OnceLock::new();
+    RESOLVER
+        .get_or_init(|| match MailAuthResolver::new_cloudflare_tls() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("Cannot build mail-auth resolver: {}", e);
+                None
+            }
+        })
+        .as_ref()
+}
+
 /// Verify SPF, DKIM and DMARC for an inbound message.
 ///
 /// `raw_message` is the full RFC 5322 bytes.
@@ -120,20 +138,12 @@ pub async fn verify(
     client_ip: IpAddr,
     server_hostname: &str,
 ) -> AuthResults {
-    // mail-auth's async resolver uses its own DNS — but we want to use our
-    // Cloudflare-only resolver. For now we use mail-auth's built-in resolver
-    // and will wire our custom hickory resolver in the next phase.
-    // TODO: replace with rmail-dns::Resolver once mail-auth supports custom resolvers.
-    let resolver = match MailAuthResolver::new_cloudflare_tls() {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Cannot build mail-auth resolver: {}", e);
-            return AuthResults {
-                spf: SpfOutcome::TempError,
-                dkim: DkimOutcome::TempError,
-                dmarc: DmarcOutcome::None,
-            };
-        }
+    let Some(resolver) = shared_resolver() else {
+        return AuthResults {
+            spf: SpfOutcome::TempError,
+            dkim: DkimOutcome::TempError,
+            dmarc: DmarcOutcome::None,
+        };
     };
 
     // ─── SPF

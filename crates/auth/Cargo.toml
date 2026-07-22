@@ -8,7 +8,6 @@ rmail-core   = { path = "../core" }
 rmail-config = { path = "../config" }
 rmail-dns    = { path = "../dns" }
 mail-auth    = { workspace = true }
-mail-parser  = { workspace = true }
 argon2       = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
